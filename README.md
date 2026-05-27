@@ -22,6 +22,14 @@ It compiles scattered AI/tool runs into one verified current-state packet, with 
 - Lead Artifact schema validation is enforced (`schemas/lead-artifact.schema.json`)
 - Technical proof note: `docs/proof_note.md`
 
+## Trust & adoption docs
+
+- `docs/adoption_quickstart.md`
+- `docs/compatibility_policy.md`
+- `docs/cli_exit_codes.md`
+- `docs/determinism.md`
+- `docs/receipt_integrity.md`
+
 ## Problem
 
 AI work is fragmented across chats, CLIs, CI logs, scripts, and partial artifacts. Teams lose truth-state when outputs are stale, contradictory, or unverifiable.
@@ -30,11 +38,11 @@ AgentMD creates one reproducible trace:
 
 ```text
 task
-  → validate context
-  → compile current-state packet
-  → enforce schema gates
-  → write proof receipts
-  → preserve audit trail
+  -> validate context
+  -> compile current-state packet
+  -> enforce schema gates
+  -> write proof receipts
+  -> preserve audit trail
 ```
 
 ## AI Work Lead
