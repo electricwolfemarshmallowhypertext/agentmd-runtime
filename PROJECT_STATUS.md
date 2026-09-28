@@ -1,8 +1,8 @@
 ﻿# PROJECT_STATUS
 
-## AgentMD Runtime v0.2
+## AgentMD Runtime security-hardening branch
 
-Status date: 2026-05-27
+Status date: 2026-09-28
 
 ## Product framing
 
@@ -20,6 +20,9 @@ Current strongest claim:
 - Lead Artifact input contract is versioned as **Lead Artifact v1** (`schema_version: "lead-artifact.v1"`).
 - Schema validation is strict and requires `jsonschema` (pinned in `requirements-cli.txt`).
 - Invalid artifacts fail with explicit schema errors.
+- Artifact paths, sizes, record counts, nesting, secrets, and output mutation boundaries are checked before writes.
+- Lead receipts bind source hashes, chain to prior valid receipts, and treat source identity as asserted rather than authenticated.
+- Accepted skill edits require a hash-bound `skill-validation.v1` receipt and may only mutate workspace-local `skills/*/SKILL.md`.
 - Runtime outputs are emitted to:
   - `.sticky/current-state.json`
   - `.sticky/current-state.md`
@@ -63,15 +66,14 @@ python -m pytest -q tests/agentmd/test_agentmd_cli.py
 Results:
 
 - `py_compile`: PASS
-- `pytest`: PASS (`16 passed`)
+- `pytest`: PASS (`36 passed`)
 - demo script: PASS
 
-## v0.2.0 Release Candidate
+## Published checkpoints
 
-- Release line: AI Work Lead + Lead Artifact v1.
-- Contract: strict schema validation with required `jsonschema` dependency.
-- Proof: deterministic packet hash + receipt hash in runtime artifacts.
-- CI proof path: `AgentMD Lead Demo` workflow.
+- `v0.2.0`: AI Work Lead + Lead Artifact v1 checkpoint.
+- `v0.3.0-alpha.2`: gated skill edit alpha published before the September 2026 security audit.
+- The local hardening branch is not a release until public `main` is remediated and fresh CI passes.
 
 ## Intentionally out of scope
 
@@ -86,4 +88,4 @@ Results:
 
 ## Next recommended technical step (NOT IMPLEMENTED)
 
-Run and publish one successful GitHub Actions proof (`AgentMD Lead Demo`) and only then tag `v0.2.0`.
+Remediate public `main`, rotate/audit repository credentials and integrations, then run fresh CI and `AgentMD Lead Demo` proof. Do not tag until those gates pass.

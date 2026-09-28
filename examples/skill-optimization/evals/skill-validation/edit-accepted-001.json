@@ -1,0 +1,12 @@
+{
+  "schema_version": "skill-validation.v1",
+  "evaluator": "agentmd-example-heldout-eval",
+  "skill_id": "skill.demo.context-summary",
+  "validation_task": "Summarize context drift findings from receipts.",
+  "baseline_score": 0.62,
+  "validation_score": 0.74,
+  "old_hash": "4a531b5ac4640ac59d71ceccbf48c483d30c3ea38281c6b046781b478daf2838",
+  "proposed_new_hash": "47cac877daa3289c7bbd1e22a413ea9bba52ddbb8036649651e8264ee80136fc",
+  "timestamp": "2026-05-27T00:00:00Z",
+  "receipt_hash": "efcc9764fe7dd1b8b1bab37c91150a33089bfe6ced2f3972de24d5a361d703db"
+}

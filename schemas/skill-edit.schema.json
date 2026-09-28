@@ -82,7 +82,13 @@
     },
     "timestamp": {
       "type": "string",
-      "minLength": 1
+      "format": "date-time",
+      "maxLength": 64
+    },
+    "validation_receipt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
     }
   },
   "additionalProperties": false

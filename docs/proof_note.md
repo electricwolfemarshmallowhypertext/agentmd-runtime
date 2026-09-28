@@ -116,11 +116,12 @@ Artifacts Ingested: 3
 | Current-state packet generated | PASS |
 | Deterministic hash repeat match | PASS |
 | Receipts written | PASS |
+| Trust metadata written | PASS |
 | Contradictions preserved | PASS |
 | Open loops preserved | PASS |
 | Time to compile | measured locally; not benchmarked |
-| Tests | 20 passed |
-| CI | green |
+| Local security and CLI tests | 36 passed |
+| Published alpha CI | historical proof; fresh post-audit run pending |
 
 ## 11. Schema proof
 
@@ -133,16 +134,16 @@ Schema:
 
 ## 12. CI and release proof
 
-- CI: green
-- AgentMD Lead Demo: green
+- Published alpha CI: historical proof from before the September 2026 security audit
+- AgentMD Lead Demo: fresh post-audit run pending
 - GitHub Actions: `https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/actions`
 - Release: `v0.3.0-alpha.2`
 - Release URL: `https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/releases/tag/v0.3.0-alpha.2`
 
 Current verified facts:
 
-- tests: `20 passed`
-- workflows: CI green, AgentMD Lead Demo green
+- local security and CLI tests: `36 passed`
+- workflows: fresh post-audit CI and AgentMD Lead Demo proof pending
 - latest release: `v0.3.0-alpha.2`
 - latest release commit: `6efc66d`
 
@@ -166,7 +167,8 @@ Schema:
 - schema validation works
 - deterministic packet generation works
 - proof receipts are written
-- skill edits are gated by validation score
+- lead receipts preserve advisory source history without treating asserted identity as authenticated trust
+- skill edits are gated by validation score and a hash-bound validation receipt
 
 ## 15. What this does not prove yet
 
@@ -174,7 +176,8 @@ Schema:
 - full adapter automation
 - multi-user/team workflow
 - autonomous optimizer loop
-- security hardening for hostile inputs
+- cryptographic source identity and signed receipts
+- independent security review of hostile-input controls
 
 ## 16. Boundaries
 

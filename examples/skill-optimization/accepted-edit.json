@@ -1,7 +1,7 @@
 {
   "schema_version": "skill-edit.v1",
   "skill_id": "skill.demo.context-summary",
-  "skill_path": "examples/skill-optimization/original.skill.md",
+  "skill_path": "skills/context-summary/SKILL.md",
   "edit_id": "edit-accepted-001",
   "edit_type": "replace",
   "target": "Use this skill to summarize repository context.",
@@ -15,5 +15,6 @@
     "metric:accuracy+0.12"
   ],
   "proposed_by": "agentmd-example",
-  "timestamp": "2026-05-27T00:00:00Z"
+  "timestamp": "2026-05-27T00:00:00Z",
+  "validation_receipt": "evals/skill-validation/edit-accepted-001.json"
 }
