@@ -32,8 +32,8 @@
     "Approve endpoint release gate exception"
   ],
   "verification_status": "needs_human_approval",
-  "context_bundle_hash": "demo-bundle-002",
-  "receipt_hash": "demo-receipt-002",
+  "context_bundle_hash": "e8e68ca4790ae8b910334985f1910b1ebb2a4018786e13cb2d9f20bdc7fe598d",
+  "receipt_hash": "257c0ae71b2c0095509dac252b19f9eb208000238acee703375c7db802f68990",
   "source_artifacts": [
     "runs/claude/002"
   ],

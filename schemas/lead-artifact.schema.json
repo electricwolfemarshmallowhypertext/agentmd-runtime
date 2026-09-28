@@ -25,38 +25,46 @@
     },
     "run_id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 256
     },
     "tool": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 128
     },
     "task": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 16384
     },
     "timestamp": {
       "type": "string",
-      "minLength": 1
+      "format": "date-time",
+      "maxLength": 64
     },
     "claims": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "anyOf": [
           {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 16384
           },
           {
             "type": "object",
             "properties": {
               "claim": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "text": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "verification_status": {
                 "type": "string"
@@ -65,29 +73,37 @@
                 "type": "string"
               }
             },
-            "additionalProperties": true
+            "anyOf": [
+              {"required": ["claim"]},
+              {"required": ["text"]}
+            ],
+            "additionalProperties": false
           }
         ]
       }
     },
     "decisions": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "anyOf": [
           {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 16384
           },
           {
             "type": "object",
             "properties": {
               "decision": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "text": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "status": {
                 "type": "string"
@@ -99,62 +115,82 @@
                 "type": "boolean"
               }
             },
-            "additionalProperties": true
+            "anyOf": [
+              {"required": ["decision"]},
+              {"required": ["text"]}
+            ],
+            "additionalProperties": false
           }
         ]
       }
     },
     "files_touched": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 16384
       }
     },
     "open_loops": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "anyOf": [
           {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 16384
           },
           {
             "type": "object",
             "properties": {
               "text": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "loop": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "item": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 16384
               },
               "status": {
                 "type": "string"
               }
             },
-            "additionalProperties": true
+            "anyOf": [
+              {"required": ["text"]},
+              {"required": ["loop"]},
+              {"required": ["item"]}
+            ],
+            "additionalProperties": false
           }
         ]
       }
     },
     "contradictions": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 16384
       }
     },
     "human_approval_items": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 16384
       }
     },
     "verification_status": {
@@ -174,17 +210,19 @@
     },
     "context_bundle_hash": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[a-fA-F0-9]{64}$"
     },
     "receipt_hash": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[a-fA-F0-9]{64}$"
     },
     "source_artifacts": {
       "type": "array",
+      "maxItems": 1000,
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 16384
       }
     },
     "git_state": {
@@ -224,8 +262,8 @@
           ]
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }

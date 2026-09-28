@@ -29,8 +29,13 @@ Depending on receipt type, provenance includes:
 - current state hash
 - git commit / dirty flag / changed files / untracked files
 - source artifact references
+- source artifact SHA-256 hashes
+- previous valid receipt hash for chain continuity
 - validation status
-- skill edit id/type/reason/score delta/edit hash (for skill gate records)
+- advisory trust metadata (`trust-weight.v1` source history, current observations, and unverified-source flags)
+- skill edit id/type/reason/score delta/edit hash and validation receipt hash (for skill gate records)
+
+Lead compilation verifies the latest receipt hash before using its trust history. Invalid or modified receipts are ignored and reported as validation warnings. Replayed artifact/run pairs are not counted again. Trust metadata remains advisory and source identity is explicitly classified as asserted.
 
 ## Tamper limitations
 
@@ -42,6 +47,7 @@ Limitations:
 - no transparency log
 - no hardware-backed attestation
 - no signature chain across environments
+- anyone with write access can still replace a receipt chain and recompute unsigned hashes
 
 ## What is not yet cryptographically signed
 

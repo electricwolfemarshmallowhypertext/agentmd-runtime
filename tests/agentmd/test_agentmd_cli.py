@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -79,10 +80,76 @@ def scaffold_workspace(root: Path) -> None:
     (root / "receipts").mkdir(parents=True, exist_ok=True)
 
 
+def valid_lead_artifact(run_id: str = "security-run-1", **overrides: object) -> dict[str, object]:
+    artifact: dict[str, object] = {
+        "schema_version": "lead-artifact.v1",
+        "run_id": run_id,
+        "tool": "codex",
+        "task": "security regression",
+        "timestamp": "2026-09-28T12:00:00Z",
+        "claims": [],
+        "decisions": [],
+        "files_touched": [],
+        "open_loops": [],
+        "contradictions": [],
+        "human_approval_items": [],
+        "verification_status": "unverified",
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+def valid_skill_edit(skill_path: str, **overrides: object) -> dict[str, object]:
+    edit: dict[str, object] = {
+        "schema_version": "skill-edit.v1",
+        "skill_id": "skill.s1",
+        "skill_path": skill_path,
+        "edit_id": "security-edit-1",
+        "edit_type": "replace",
+        "target": "Use for context drift checks.",
+        "replacement": "Use for context drift checks with validation gates.",
+        "reason": "Security regression coverage.",
+        "baseline_score": 0.61,
+        "validation_score": 0.74,
+        "validation_task": "repo context drift review",
+        "evidence": ["eval:heldout-1"],
+        "proposed_by": "test-suite",
+        "timestamp": "2026-09-28T12:00:00Z",
+    }
+    edit.update(overrides)
+    return edit
+
+
+def write_skill_validation_receipt(root: Path, edit: dict[str, object]) -> Path:
+    skill_file = root / str(edit["skill_path"])
+    old_text = skill_file.read_text(encoding="utf-8")
+    target = str(edit["target"])
+    replacement = str(edit["replacement"])
+    proposed_text = old_text.replace(target, replacement, 1)
+    receipt: dict[str, object] = {
+        "schema_version": "skill-validation.v1",
+        "evaluator": "test-suite",
+        "skill_id": edit["skill_id"],
+        "validation_task": edit["validation_task"],
+        "baseline_score": edit["baseline_score"],
+        "validation_score": edit["validation_score"],
+        "old_hash": hashlib.sha256(skill_file.read_bytes()).hexdigest(),
+        "proposed_new_hash": hashlib.sha256(proposed_text.encode("utf-8")).hexdigest(),
+        "timestamp": "2026-09-28T12:00:00Z",
+    }
+    material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    receipt["receipt_hash"] = hashlib.sha256(material).hexdigest()
+    receipt_dir = root / "evals" / "skill-validation"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = receipt_dir / f"{edit['edit_id']}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    return receipt_path
+
+
 def test_doctor_passes_with_valid_scaffold(ws: Path) -> None:
     scaffold_workspace(ws)
     result = runner.invoke(app, ["doctor", "--root", str(ws)])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     assert "doctor: PASS" in result.stdout
 
 
@@ -272,19 +339,25 @@ def test_lead_compile_ingests_artifact_and_writes_outputs(ws: Path) -> None:
                 "schema_version": "lead-artifact.v1",
                 "run_id": "run-1",
                 "timestamp": "2026-05-20T00:00:00Z",
-                "agent": "codex",
+                "tool": "codex",
                 "task": "compile current state",
-                "files_touched": ["memory/state.md"],
-                "claims_made": [{"claim": "AGENTS.md exists", "verification_status": "verified"}],
-                "decisions_made": [{"decision": "Defer deployment", "requires_human_approval": True}],
+                "files_touched": ["AGENTS.md", "memory/state.md"],
+                "claims": [{"claim": "AGENTS.md exists", "verification_status": "verified"}],
+                "decisions": [{"decision": "Defer deployment", "requires_human_approval": True}],
                 "open_loops": ["Confirm policy owner"],
                 "verification_status": "partial",
-                "context_bundle_hash": "bundle-abc",
-                "receipt_hash": "receipt-abc",
-                "changed_files": ["AGENTS.md"],
-                "untracked_files": ["notes/tmp.md"],
-                "git_available": False,
-                "git_reason": "not_a_git_repository",
+                "context_bundle_hash": "a" * 64,
+                "receipt_hash": "b" * 64,
+                "contradictions": [],
+                "human_approval_items": [],
+                "git_state": {
+                    "available": False,
+                    "commit": None,
+                    "dirty": None,
+                    "changed_files": ["AGENTS.md"],
+                    "untracked_files": ["notes/tmp.md"],
+                    "reason": "not_a_git_repository",
+                },
             }
         )
         + "\n",
@@ -306,7 +379,11 @@ def test_lead_compile_ingests_artifact_and_writes_outputs(ws: Path) -> None:
     assert payload["artifacts_ingested"] == 1
     assert payload["task"] == "compile current state"
     assert payload["proof"]["run_id"] == "run-1"
-    assert payload["proof"]["context_bundle_hash"] == "bundle-abc"
+    assert payload["proof"]["context_bundle_hash"] == "a" * 64
+    claim_source = payload["provenance"]["claims"]["AGENTS.md exists"][0]
+    assert claim_source["run_id"] == "run-1"
+    assert claim_source["source_sha256"]
+    assert claim_source["source_authentication"] == "asserted"
     assert "AGENTS.md" in payload["current_state"]["what_changed"]
     loop_texts = {loop["text"] for loop in payload["current_state"]["open_loops"]}
     assert "Confirm policy owner" in loop_texts
@@ -325,12 +402,15 @@ def test_lead_compile_is_deterministic_for_same_artifact_input(ws: Path) -> None
         "timestamp": "2026-05-20T01:02:03Z",
         "task": "deterministic packet",
         "files_touched": ["memory/state.md", "policies/p1.yaml"],
-        "claims_made": [{"claim": "policy loaded", "verification_status": "verified"}],
+        "claims": [{"claim": "policy loaded", "verification_status": "verified"}],
+        "decisions": [],
         "open_loops": ["confirm reviewer"],
-        "context_bundle_hash": "bundle-stable",
-        "receipt_hash": "receipt-stable",
-        "git_available": False,
-        "git_reason": "not_a_git_repository",
+        "contradictions": [],
+        "human_approval_items": [],
+        "verification_status": "verified",
+        "context_bundle_hash": "c" * 64,
+        "receipt_hash": "d" * 64,
+        "git_state": {"available": False, "reason": "not_a_git_repository"},
     }
     artifact_path.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
 
@@ -359,8 +439,13 @@ def test_lead_compile_preserves_contradictions_and_open_loops(ws: Path) -> None:
                         "tool": "codex",
                         "timestamp": "2026-05-20T00:00:00Z",
                         "task": "check contradiction handling",
-                        "claims_made": [{"claim": "service door was sealed", "verification_status": "verified"}],
+                        "claims": [{"claim": "service door was sealed", "verification_status": "verified"}],
+                        "decisions": [],
+                        "files_touched": [],
                         "open_loops": ["Find Mara"],
+                        "contradictions": [],
+                        "human_approval_items": [],
+                        "verification_status": "verified",
                     }
                 ),
                 json.dumps(
@@ -370,8 +455,13 @@ def test_lead_compile_preserves_contradictions_and_open_loops(ws: Path) -> None:
                         "tool": "claude",
                         "timestamp": "2026-05-20T00:01:00Z",
                         "task": "check contradiction handling",
-                        "claims_made": [{"claim": "service door was sealed", "verification_status": "contradicted"}],
+                        "claims": [{"claim": "service door was sealed", "verification_status": "contradicted"}],
+                        "decisions": [],
+                        "files_touched": [],
                         "open_loops": ["Inspect pantry"],
+                        "contradictions": [],
+                        "human_approval_items": [],
+                        "verification_status": "contradicted",
                     }
                 ),
             ]
@@ -392,6 +482,180 @@ def test_lead_compile_preserves_contradictions_and_open_loops(ws: Path) -> None:
     approvals = payload["current_state"]["what_needs_human_approval"]
     assert any(item.startswith("Resolve contradiction: service door was sealed") for item in approvals)
 
+
+
+def test_lead_compile_receipt_marks_source_identity_unverified(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact_path = ws / "low-trust.jsonl"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "lead-artifact.v1",
+                "run_id": "low-trust-run",
+                "tool": "claude",
+                "timestamp": "2026-05-20T00:02:00Z",
+                "task": "compile trust scoring",
+                "claims": [
+                    {"claim": "deployment gate passed", "verification_status": "contradicted"},
+                    {"claim": "receipt was uploaded", "verification_status": "contradicted"},
+                ],
+                "decisions": [],
+                "files_touched": ["cli/agentmd.py"],
+                "open_loops": [],
+                "contradictions": [],
+                "human_approval_items": [],
+                "verification_status": "contradicted",
+                "git_state": {"available": False, "reason": "not_a_git_repository"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    assert result.exit_code == 0
+
+    receipt_files = sorted((ws / ".sticky" / "receipts").glob("*.jsonl"))
+    assert receipt_files
+    receipt = json.loads(receipt_files[-1].read_text(encoding="utf-8").strip())
+    trust = receipt["trust"]
+    assert trust["version"] == "trust-weight.v1"
+    assert trust["source_history"]["claude"]["contradicted_claims"] == 2
+    assert trust["source_history"]["claude"]["trust_weight"] is None
+    assert trust["source_history"]["claude"]["asserted_signal_weight"] < trust["low_trust_threshold"]
+    assert any(
+        flag["flag"] == "unverified_source_identity" and flag["source"] == "claude"
+        for flag in trust["entry_flags"]
+    )
+    assert any("unverified_source_identity: claude" in warning for warning in receipt["validation_warnings"])
+
+
+def test_lead_compile_trust_history_persists_across_receipts(ws: Path) -> None:
+    scaffold_workspace(ws)
+    first_artifact = ws / "trust-first.json"
+    first_artifact.write_text(
+        json.dumps(
+            {
+                "schema_version": "lead-artifact.v1",
+                "run_id": "trust-run-1",
+                "tool": "codex",
+                "timestamp": "2026-05-20T00:03:00Z",
+                "task": "compile trust history",
+                "claims": [{"claim": "receipt includes git metadata", "verification_status": "verified"}],
+                "decisions": [],
+                "files_touched": ["cli/agentmd.py"],
+                "open_loops": [],
+                "contradictions": [],
+                "human_approval_items": [],
+                "verification_status": "verified",
+                "git_state": {"available": False, "reason": "not_a_git_repository"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    second_artifact = ws / "trust-second.json"
+    second_artifact.write_text(
+        json.dumps(
+            {
+                "schema_version": "lead-artifact.v1",
+                "run_id": "trust-run-2",
+                "tool": "codex",
+                "timestamp": "2026-05-20T00:04:00Z",
+                "task": "compile trust history",
+                "claims": [{"claim": "receipt includes git metadata", "verification_status": "contradicted"}],
+                "decisions": [],
+                "files_touched": ["cli/agentmd.py"],
+                "open_loops": [],
+                "contradictions": [],
+                "human_approval_items": [],
+                "verification_status": "contradicted",
+                "git_state": {"available": False, "reason": "not_a_git_repository"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(first_artifact)])
+    assert first.exit_code == 0
+    second = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(second_artifact)])
+    assert second.exit_code == 0
+
+    receipt_files = sorted((ws / ".sticky" / "receipts").glob("*.jsonl"))
+    assert len(receipt_files) == 2
+    receipt = json.loads(receipt_files[-1].read_text(encoding="utf-8").strip())
+    codex_history = receipt["trust"]["source_history"]["codex"]
+    assert codex_history["confirmed_claims"] == 1
+    assert codex_history["contradicted_claims"] == 1
+    assert receipt["trust"]["current_observations"]["codex"]["contradicted_claims"] == 1
+
+
+def test_lead_compile_does_not_double_count_replayed_artifact(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact_path = ws / "replay.json"
+    artifact_path.write_text(
+        json.dumps(
+            valid_lead_artifact(
+                run_id="replay-run",
+                claims=[{"claim": "same observation", "verification_status": "verified"}],
+                verification_status="verified",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    first = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    second = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+
+    receipt_files = sorted((ws / ".sticky" / "receipts").glob("*.jsonl"))
+    receipt = json.loads(receipt_files[-1].read_text(encoding="utf-8").strip())
+    codex_history = receipt["trust"]["source_history"]["codex"]
+    assert codex_history["confirmed_claims"] == 1
+    assert receipt["trust"]["current_observations"] == {}
+    assert receipt["previous_receipt_hash"]
+
+
+def test_lead_compile_ignores_tampered_receipt_history(ws: Path) -> None:
+    scaffold_workspace(ws)
+    first_artifact = ws / "first.json"
+    first_artifact.write_text(
+        json.dumps(
+            valid_lead_artifact(
+                run_id="tamper-run-1",
+                claims=[{"claim": "first observation", "verification_status": "verified"}],
+                verification_status="verified",
+            )
+        ),
+        encoding="utf-8",
+    )
+    first = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(first_artifact)])
+    assert first.exit_code == 0
+
+    first_receipt_path = sorted((ws / ".sticky" / "receipts").glob("*.jsonl"))[-1]
+    tampered_receipt = json.loads(first_receipt_path.read_text(encoding="utf-8").strip())
+    tampered_receipt["task"] = "tampered task"
+    first_receipt_path.write_text(json.dumps(tampered_receipt) + "\n", encoding="utf-8")
+
+    second_artifact = ws / "second.json"
+    second_artifact.write_text(
+        json.dumps(
+            valid_lead_artifact(
+                run_id="tamper-run-2",
+                claims=[{"claim": "second observation", "verification_status": "contradicted"}],
+                verification_status="contradicted",
+            )
+        ),
+        encoding="utf-8",
+    )
+    second = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(second_artifact)])
+    assert second.exit_code == 0
+
+    second_receipt_path = sorted((ws / ".sticky" / "receipts").glob("*.jsonl"))[-1]
+    second_receipt = json.loads(second_receipt_path.read_text(encoding="utf-8").strip())
+    assert second_receipt["previous_receipt_hash"] is None
+    assert second_receipt["trust"]["source_history"]["codex"]["confirmed_claims"] == 0
+    assert any("receipt_history_hash_mismatch" in item for item in second_receipt["validation_warnings"])
 
 
 def test_lead_compile_rejects_invalid_artifact_schema(ws: Path) -> None:
@@ -468,8 +732,8 @@ def test_lead_compile_accepts_valid_artifact_schema(ws: Path) -> None:
                 "contradictions": [],
                 "human_approval_items": [],
                 "verification_status": "verified",
-                "context_bundle_hash": "bundle-valid",
-                "receipt_hash": "receipt-valid",
+                "context_bundle_hash": "e" * 64,
+                "receipt_hash": "f" * 64,
                 "source_artifacts": ["tool-output/123"],
                 "git_state": {
                     "available": False,
@@ -494,7 +758,8 @@ def test_lead_compile_accepts_valid_artifact_schema(ws: Path) -> None:
 
 def test_lead_compile_demo_artifacts_still_compile(ws: Path) -> None:
     scaffold_workspace(ws)
-    demo_dir = REPO_ROOT / "examples" / "lead-artifacts"
+    demo_dir = ws / "examples" / "lead-artifacts"
+    shutil.copytree(REPO_ROOT / "examples" / "lead-artifacts", demo_dir)
     result = runner.invoke(
         app,
         [
@@ -518,7 +783,8 @@ def test_lead_compile_demo_artifacts_still_compile(ws: Path) -> None:
 
 def test_lead_compile_template_artifact_compiles(ws: Path) -> None:
     scaffold_workspace(ws)
-    template_path = REPO_ROOT / "examples" / "lead-artifacts" / "template.lead-artifact.json"
+    template_path = ws / "template.lead-artifact.json"
+    shutil.copy2(REPO_ROOT / "examples" / "lead-artifacts" / "template.lead-artifact.json", template_path)
     result = runner.invoke(
         app,
         [
@@ -539,32 +805,32 @@ def test_lead_compile_template_artifact_compiles(ws: Path) -> None:
 def test_skill_apply_edit_accepts_and_writes_receipt(ws: Path) -> None:
     scaffold_workspace(ws)
     edit_path = ws / "accepted-edit.json"
+    edit = {
+        "schema_version": "skill-edit.v1",
+        "skill_id": "skill.s1",
+        "skill_path": "skills/s1/SKILL.md",
+        "edit_id": "edit-accept-1",
+        "edit_type": "replace",
+        "target": "Use for context drift checks.",
+        "replacement": "Use for context drift checks with validation gates.",
+        "reason": "Improve held-out validation performance.",
+        "baseline_score": 0.61,
+        "validation_score": 0.74,
+        "validation_task": "repo context drift review",
+        "evidence": ["eval:heldout-1"],
+        "proposed_by": "test-suite",
+        "timestamp": "2026-05-27T00:00:00Z",
+    }
+    validation_receipt = write_skill_validation_receipt(ws, edit)
+    edit["validation_receipt"] = validation_receipt.relative_to(ws).as_posix()
     edit_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "skill-edit.v1",
-                "skill_id": "skill.s1",
-                "skill_path": "skills/s1/SKILL.md",
-                "edit_id": "edit-accept-1",
-                "edit_type": "replace",
-                "target": "Use for context drift checks.",
-                "replacement": "Use for context drift checks with validation gates.",
-                "reason": "Improve held-out validation performance.",
-                "baseline_score": 0.61,
-                "validation_score": 0.74,
-                "validation_task": "repo context drift review",
-                "evidence": ["eval:heldout-1"],
-                "proposed_by": "test-suite",
-                "timestamp": "2026-05-27T00:00:00Z",
-            },
-            indent=2,
-        )
+        json.dumps(edit, indent=2)
         + "\n",
         encoding="utf-8",
     )
 
     result = runner.invoke(app, ["skill", "apply-edit", "--root", str(ws), "--edit", str(edit_path)])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     assert "decision: accepted" in result.stdout
 
     skill_body = (ws / "skills" / "s1" / "SKILL.md").read_text(encoding="utf-8")
@@ -576,6 +842,7 @@ def test_skill_apply_edit_accepts_and_writes_receipt(ws: Path) -> None:
     assert receipt["decision"] == "accepted"
     assert receipt["score_delta"] > 0
     assert receipt["old_hash"] != receipt["new_hash"]
+    assert receipt["validation_receipt_hash"]
 
 
 def test_skill_apply_edit_rejects_and_writes_rejection_record(ws: Path) -> None:
@@ -717,3 +984,229 @@ def test_skill_apply_edit_fails_for_ambiguous_or_missing_target(ws: Path) -> Non
     missing_result = runner.invoke(app, ["skill", "apply-edit", "--root", str(ws), "--edit", str(missing_edit)])
     assert missing_result.exit_code == 1
     assert "skill_edit_target_not_found" in missing_result.stdout
+
+
+def test_skill_apply_edit_rejects_absolute_and_traversal_paths(ws: Path) -> None:
+    scaffold_workspace(ws)
+    outside_file = ws / "outside.md"
+    outside_file.write_text("Use for context drift checks.\n", encoding="utf-8")
+
+    absolute_edit = ws / "absolute-edit.json"
+    absolute_edit.write_text(json.dumps(valid_skill_edit(str(outside_file))), encoding="utf-8")
+    absolute_result = runner.invoke(
+        app,
+        ["skill", "apply-edit", "--root", str(ws), "--edit", str(absolute_edit)],
+    )
+    assert absolute_result.exit_code == 1
+    assert "skill_edit_absolute_path_forbidden" in absolute_result.stdout
+
+    traversal_edit = ws / "traversal-edit.json"
+    traversal_edit.write_text(
+        json.dumps(valid_skill_edit("skills/s1/../../outside.md", edit_id="security-edit-2")),
+        encoding="utf-8",
+    )
+    traversal_result = runner.invoke(
+        app,
+        ["skill", "apply-edit", "--root", str(ws), "--edit", str(traversal_edit)],
+    )
+    assert traversal_result.exit_code == 1
+    assert "skill_edit_path_outside_skills" in traversal_result.stdout
+    assert outside_file.read_text(encoding="utf-8") == "Use for context drift checks.\n"
+
+
+def test_skill_apply_edit_rejects_proposal_outside_workspace(ws: Path) -> None:
+    scaffold_workspace(ws)
+    outside_edit = ws.parent / f"{ws.name}-outside-edit.json"
+    outside_edit.write_text(
+        json.dumps(valid_skill_edit("skills/s1/SKILL.md")),
+        encoding="utf-8",
+    )
+    try:
+        result = runner.invoke(
+            app,
+            ["skill", "apply-edit", "--root", str(ws), "--edit", str(outside_edit)],
+        )
+    finally:
+        outside_edit.unlink(missing_ok=True)
+
+    assert result.exit_code == 1
+    assert "skill_edit_input_outside_workspace" in result.stdout
+
+
+def test_skill_apply_edit_rejects_skill_id_mismatch(ws: Path) -> None:
+    scaffold_workspace(ws)
+    edit_path = ws / "mismatch-edit.json"
+    edit_path.write_text(
+        json.dumps(valid_skill_edit("skills/s1/SKILL.md", skill_id="skill.other")),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["skill", "apply-edit", "--root", str(ws), "--edit", str(edit_path)])
+    assert result.exit_code == 1
+    assert "skill_edit_skill_id_mismatch" in result.stdout
+
+
+def test_skill_apply_edit_requires_hash_verified_validation_receipt(ws: Path) -> None:
+    scaffold_workspace(ws)
+    edit = valid_skill_edit("skills/s1/SKILL.md")
+    edit_path = ws / "missing-validation-receipt.json"
+    edit_path.write_text(json.dumps(edit), encoding="utf-8")
+    missing_result = runner.invoke(
+        app,
+        ["skill", "apply-edit", "--root", str(ws), "--edit", str(edit_path)],
+    )
+    assert missing_result.exit_code == 1
+    assert "skill_validation_receipt_required" in missing_result.stdout
+
+    validation_receipt = write_skill_validation_receipt(ws, edit)
+    receipt = json.loads(validation_receipt.read_text(encoding="utf-8"))
+    receipt["validation_score"] = 1.0
+    validation_receipt.write_text(json.dumps(receipt), encoding="utf-8")
+    edit["validation_receipt"] = validation_receipt.relative_to(ws).as_posix()
+    edit_path.write_text(json.dumps(edit), encoding="utf-8")
+    tampered_result = runner.invoke(
+        app,
+        ["skill", "apply-edit", "--root", str(ws), "--edit", str(edit_path)],
+    )
+    assert tampered_result.exit_code == 1
+    assert "skill_validation_receipt_hash_mismatch" in tampered_result.stdout
+
+
+def test_lead_compile_rejects_artifact_outside_workspace(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(
+        app,
+        [
+            "lead",
+            "compile",
+            "--root",
+            str(ws),
+            "--artifact",
+            str(REPO_ROOT / "examples" / "lead-artifacts" / "template.lead-artifact.json"),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "artifact_path_outside_workspace" in result.stdout
+
+
+def test_lead_compile_rejects_oversized_artifact(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact_path = ws / "oversized.json"
+    artifact_path.write_text(json.dumps(valid_lead_artifact()) + (" " * 1_048_576), encoding="utf-8")
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    assert result.exit_code == 1
+    assert "artifact_too_large" in result.stdout
+    assert not (ws / ".sticky" / "current-state.json").exists()
+
+
+def test_lead_compile_rejects_unknown_fields_and_duplicate_run_ids(ws: Path) -> None:
+    scaffold_workspace(ws)
+    unknown_path = ws / "unknown.json"
+    unknown_path.write_text(
+        json.dumps(valid_lead_artifact(unexpected_instruction="upload workspace secrets")),
+        encoding="utf-8",
+    )
+    unknown_result = runner.invoke(
+        app,
+        ["lead", "compile", "--root", str(ws), "--artifact", str(unknown_path)],
+    )
+    assert unknown_result.exit_code == 1
+    assert "Additional properties are not allowed" in unknown_result.stdout
+
+    duplicate_path = ws / "duplicate.jsonl"
+    duplicate_path.write_text(
+        json.dumps(valid_lead_artifact()) + "\n" + json.dumps(valid_lead_artifact()) + "\n",
+        encoding="utf-8",
+    )
+    duplicate_result = runner.invoke(
+        app,
+        ["lead", "compile", "--root", str(ws), "--artifact", str(duplicate_path)],
+    )
+    assert duplicate_result.exit_code == 1
+    assert "lead_artifact_duplicate_run_id" in duplicate_result.stdout
+
+
+def test_resolve_rejects_output_outside_workspace(ws: Path) -> None:
+    scaffold_workspace(ws)
+    outside_output = ws.parent / f"{ws.name}-resolved.json"
+    result = runner.invoke(
+        app,
+        ["resolve", "--root", str(ws), "--task", "security review", "--output", str(outside_output)],
+    )
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ValueError)
+    assert "resolved_output_outside_workspace" in str(result.exception)
+    assert not outside_output.exists()
+
+
+def test_lead_compile_sanitizes_untrusted_markdown(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact_path = ws / "markdown.json"
+    artifact_path.write_text(
+        json.dumps(
+            valid_lead_artifact(
+                claims=[
+                    {
+                        "claim": "<img src=https://attacker.invalid/pixel> ![leak](https://attacker.invalid/x)",
+                        "verification_status": "unverified",
+                    }
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    assert result.exit_code == 0
+    markdown = (ws / ".sticky" / "current-state.md").read_text(encoding="utf-8")
+    assert "<img" not in markdown
+    assert "![leak]" not in markdown
+    assert "&lt;img" in markdown
+
+
+def test_lead_compile_rejects_secrets_without_echoing_them(ws: Path) -> None:
+    scaffold_workspace(ws)
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+    artifact_path = ws / "secret.json"
+    artifact_path.write_text(
+        json.dumps(valid_lead_artifact(claims=[{"claim": secret, "verification_status": "unverified"}])),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+    assert result.exit_code == 1
+    assert "lead_artifact_secret_detected" in result.stdout
+    assert secret not in result.stdout
+    assert not (ws / ".sticky" / "current-state.json").exists()
+
+
+def test_lead_compile_rejects_secret_in_auto_discovered_artifact(ws: Path) -> None:
+    scaffold_workspace(ws)
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+    receipt_path = ws / "receipts" / "untrusted.jsonl"
+    receipt_path.write_text(
+        json.dumps(valid_lead_artifact(claims=[{"claim": secret, "verification_status": "unverified"}])) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+
+    assert result.exit_code == 1
+    assert "lead_artifact_secret_detected" in result.stdout
+    assert secret not in result.stdout
+    assert not (ws / ".sticky" / "current-state.json").exists()
+
+
+def test_lead_compile_rejects_excessive_json_depth(ws: Path) -> None:
+    scaffold_workspace(ws)
+    nested: object = "value"
+    for _ in range(40):
+        nested = [nested]
+    artifact_path = ws / "deep.json"
+    artifact_path.write_text(
+        json.dumps(valid_lead_artifact(claims=nested)),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+
+    assert result.exit_code == 1
+    assert "artifact_json_too_deep" in result.stdout
+    assert not (ws / ".sticky" / "current-state.json").exists()

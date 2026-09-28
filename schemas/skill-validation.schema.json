@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmd.dev/schemas/skill-validation.schema.json",
+  "title": "AgentMD Skill Validation Receipt",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "evaluator",
+    "skill_id",
+    "validation_task",
+    "baseline_score",
+    "validation_score",
+    "old_hash",
+    "proposed_new_hash",
+    "timestamp",
+    "receipt_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "skill-validation.v1"},
+    "evaluator": {"type": "string", "minLength": 1, "maxLength": 256},
+    "skill_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "validation_task": {"type": "string", "minLength": 1, "maxLength": 16384},
+    "baseline_score": {"type": "number"},
+    "validation_score": {"type": "number"},
+    "old_hash": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "proposed_new_hash": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 64},
+    "receipt_hash": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"}
+  },
+  "additionalProperties": false
+}

@@ -64,6 +64,19 @@ ADAPTER_INSTRUCTIONS = {
 
 LEAD_ARTIFACT_SCHEMA_FILE = "schemas/lead-artifact.schema.json"
 SKILL_EDIT_SCHEMA_FILE = "schemas/skill-edit.schema.json"
+SKILL_VALIDATION_SCHEMA_FILE = "schemas/skill-validation.schema.json"
+TRUST_WEIGHT_VERSION = "trust-weight.v1"
+TRUST_LOW_THRESHOLD = 0.5
+LEAD_MAX_ARTIFACT_BYTES = 1_048_576
+LEAD_MAX_JSONL_RECORDS = 1_000
+LEAD_MAX_JSON_DEPTH = 32
+LEAD_SECRET_PATTERNS = {
+    "openai_key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "github_token": re.compile(r"\bgh[opsu]_[A-Za-z0-9]{30,}\b"),
+    "huggingface_token": re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    "aws_access_key": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+}
 
 
 def _utc_now_iso() -> str:
@@ -72,6 +85,36 @@ def _utc_now_iso() -> str:
 
 def _load_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        delete=False,
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    ) as tmp:
+        tmp.write(text)
+        tmp_path = Path(tmp.name)
+    try:
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _require_path_within(path: Path, parent: Path, error_code: str) -> Path:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    try:
+        resolved_path.relative_to(resolved_parent)
+    except ValueError as e:
+        raise ValueError(f"{error_code}: {resolved_path}") from e
+    return resolved_path
 
 
 def _sha256_file(path: Path) -> str:
@@ -491,8 +534,9 @@ def resolve_context(root: Path, task: str, output_path: Path | None = None) -> t
     out_path = output_path if output_path is not None else Path(".agentmd/resolved-context.json")
     if not out_path.is_absolute():
         out_path = root / out_path
+    out_path = _require_path_within(out_path, root, "resolved_output_outside_workspace")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    _atomic_write_text(out_path, json.dumps(output, indent=2))
     resolved_out = out_path.resolve()
     _write_resolved_pointer(root, resolved_out)
     return output, resolved_out
@@ -623,15 +667,12 @@ def write_receipt(
     receipts_dir.mkdir(parents=True, exist_ok=True)
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
     out_path = receipts_dir / filename
-    out_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    _atomic_write_text(out_path, json.dumps(receipt) + "\n")
     return out_path, receipt
 
 
 def _schema_candidates(root: Path, schema_file: str) -> list[Path]:
-    return [
-        root / schema_file,
-        Path(__file__).resolve().parents[1] / schema_file,
-    ]
+    return [Path(__file__).resolve().parents[1] / schema_file]
 
 
 def _load_json_schema(root: Path, schema_file: str, missing_code: str) -> dict[str, Any]:
@@ -663,7 +704,7 @@ def _require_jsonschema() -> Any:
 
 def _validate_json_payload(payload: dict[str, Any], schema: dict[str, Any], error_prefix: str) -> list[str]:
     jsonschema = _require_jsonschema()
-    validator = jsonschema.Draft202012Validator(schema)
+    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
     errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
     out: list[str] = []
     for err in errors:
@@ -677,7 +718,7 @@ def _validate_json_payload(payload: dict[str, Any], schema: dict[str, Any], erro
 
 def _load_skill_edit_payload(root: Path, edit_path: Path) -> dict[str, Any]:
     path = edit_path if edit_path.is_absolute() else (root / edit_path)
-    path = path.resolve()
+    path = _require_path_within(path, root, "skill_edit_input_outside_workspace")
     if not path.exists() or not path.is_file():
         raise ValueError(f"skill_edit_missing: {_display_path(root, path)}")
     try:
@@ -714,8 +755,48 @@ def _write_skill_gate_record(root: Path, relative_dir: str, record: dict[str, An
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     out_path = out_dir / f"{timestamp}.jsonl"
-    out_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _atomic_write_text(out_path, json.dumps(record) + "\n")
     return out_path
+
+
+def _load_skill_validation_receipt(
+    root: Path,
+    receipt_path_raw: str,
+    expected: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    receipt_path = Path(receipt_path_raw)
+    if receipt_path.is_absolute():
+        raise ValueError("skill_validation_receipt_absolute_path_forbidden")
+    receipt_file = _require_path_within(
+        root / receipt_path,
+        root / "evals" / "skill-validation",
+        "skill_validation_receipt_outside_evals",
+    )
+    if receipt_file.suffix.lower() != ".json" or not receipt_file.is_file():
+        raise ValueError(f"skill_validation_receipt_missing: {_display_path(root, receipt_file)}")
+    try:
+        receipt = json.loads(receipt_file.read_text(encoding="utf-8", errors="strict"))
+    except Exception as e:
+        raise ValueError(f"skill_validation_receipt_invalid_json: {_display_path(root, receipt_file)} ({e})") from e
+    if not isinstance(receipt, dict):
+        raise ValueError("skill_validation_receipt_invalid_shape")
+
+    schema = _load_json_schema(root, SKILL_VALIDATION_SCHEMA_FILE, "skill_validation_schema_missing")
+    schema_errors = _validate_json_payload(receipt, schema, "skill_validation_schema_invalid")
+    if schema_errors:
+        raise ValueError("; ".join(schema_errors))
+
+    claimed_hash = str(receipt.get("receipt_hash") or "")
+    material_receipt = dict(receipt)
+    material_receipt.pop("receipt_hash", None)
+    material = json.dumps(material_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if hashlib.sha256(material).hexdigest() != claimed_hash:
+        raise ValueError("skill_validation_receipt_hash_mismatch")
+
+    for field, value in expected.items():
+        if receipt.get(field) != value:
+            raise ValueError(f"skill_validation_receipt_mismatch: {field}")
+    return receipt_file, receipt
 
 
 def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, Any]]:
@@ -729,13 +810,20 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     if not skill_path_raw:
         raise ValueError("skill_edit_invalid_skill_path")
     skill_path = Path(skill_path_raw)
-    skill_file = skill_path if skill_path.is_absolute() else (root / skill_path)
-    skill_file = skill_file.resolve()
+    if skill_path.is_absolute():
+        raise ValueError("skill_edit_absolute_path_forbidden")
+    skill_file = _require_path_within(root / skill_path, root / "skills", "skill_edit_path_outside_skills")
+    relative_skill_path = skill_file.relative_to((root / "skills").resolve())
+    if len(relative_skill_path.parts) != 2 or relative_skill_path.name != "SKILL.md":
+        raise ValueError("skill_edit_path_must_match: skills/<skill-name>/SKILL.md")
     if not skill_file.exists() or not skill_file.is_file():
         raise ValueError(f"skill_file_missing: {_display_path(root, skill_file)}")
 
     old_text = _load_text(skill_file)
     old_hash = _sha256_file(skill_file)
+    skill_metadata, _ = _parse_front_matter(old_text)
+    if str(skill_metadata.get("id") or "").strip() != str(edit_payload.get("skill_id") or "").strip():
+        raise ValueError("skill_edit_skill_id_mismatch")
 
     edit_type = str(edit_payload.get("edit_type") or "").strip()
     target = str(edit_payload.get("target") or "")
@@ -746,15 +834,33 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     temp_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="agentmd-skill-edit-", dir=temp_parent) as tmp_dir:
         tmp_path = Path(tmp_dir) / skill_file.name
-        tmp_path.write_text(old_text, encoding="utf-8")
         new_text = _apply_bounded_skill_edit(old_text, edit_type, target, replacement)
-        tmp_path.write_text(new_text, encoding="utf-8")
+        _atomic_write_text(tmp_path, new_text)
         proposed_hash = _sha256_file(tmp_path)
 
     baseline_score = float(edit_payload.get("baseline_score"))
     validation_score = float(edit_payload.get("validation_score"))
     score_delta = validation_score - baseline_score
     accepted = validation_score > baseline_score
+
+    validation_receipt_path: Path | None = None
+    validation_receipt: dict[str, Any] | None = None
+    if accepted:
+        validation_receipt_raw = str(edit_payload.get("validation_receipt") or "").strip()
+        if not validation_receipt_raw:
+            raise ValueError("skill_validation_receipt_required")
+        validation_receipt_path, validation_receipt = _load_skill_validation_receipt(
+            root,
+            validation_receipt_raw,
+            {
+                "skill_id": str(edit_payload.get("skill_id")),
+                "validation_task": str(edit_payload.get("validation_task")),
+                "baseline_score": baseline_score,
+                "validation_score": validation_score,
+                "old_hash": old_hash,
+                "proposed_new_hash": proposed_hash,
+            },
+        )
 
     edit_material = json.dumps(edit_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     edit_hash = hashlib.sha256(edit_material).hexdigest()
@@ -780,10 +886,15 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
         "new_hash": proposed_hash if accepted else old_hash,
         "proposed_new_hash": proposed_hash,
         "edit_hash": edit_hash,
+        "validation_receipt": _display_path(root, validation_receipt_path) if validation_receipt_path else None,
+        "validation_receipt_hash": validation_receipt.get("receipt_hash") if validation_receipt else None,
+        "validation_evaluator": validation_receipt.get("evaluator") if validation_receipt else None,
     }
 
     if accepted:
-        skill_file.write_text(new_text, encoding="utf-8")
+        if _sha256_file(skill_file) != old_hash:
+            raise ValueError("skill_edit_target_changed_during_validation")
+        _atomic_write_text(skill_file, new_text)
         base_record["new_hash"] = _sha256_file(skill_file)
         receipt_path = _write_skill_gate_record(root, "skill-receipts", base_record)
         return "accepted", receipt_path, base_record
@@ -840,6 +951,36 @@ def _lead_dedupe_sorted(items: list[str]) -> list[str]:
     return sorted({item for item in items if item})
 
 
+def _lead_json_depth(value: Any, depth: int = 0) -> int:
+    if depth > LEAD_MAX_JSON_DEPTH:
+        return depth
+    if isinstance(value, dict):
+        return max((_lead_json_depth(item, depth + 1) for item in value.values()), default=depth)
+    if isinstance(value, list):
+        return max((_lead_json_depth(item, depth + 1) for item in value), default=depth)
+    return depth
+
+
+def _lead_check_json_depth(value: Any, source: str) -> None:
+    if _lead_json_depth(value) > LEAD_MAX_JSON_DEPTH:
+        raise ValueError(f"artifact_json_too_deep: {source} limit={LEAD_MAX_JSON_DEPTH}")
+
+
+def _lead_secret_findings(value: Any, path: str = "$") -> list[str]:
+    findings: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            findings.extend(_lead_secret_findings(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            findings.extend(_lead_secret_findings(item, f"{path}[{index}]"))
+    elif isinstance(value, str):
+        for name, pattern in LEAD_SECRET_PATTERNS.items():
+            if pattern.search(value):
+                findings.append(f"{path}:{name}")
+    return findings
+
+
 def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[dict[str, Any], str]], list[str]]:
     records: list[tuple[dict[str, Any], str]] = []
     warnings: list[str] = []
@@ -847,20 +988,31 @@ def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[d
     if not path.exists() or not path.is_file():
         warnings.append(f"artifact_missing: {source}")
         return records, warnings
+    if path.stat().st_size > LEAD_MAX_ARTIFACT_BYTES:
+        warnings.append(f"artifact_too_large: {source} limit={LEAD_MAX_ARTIFACT_BYTES}")
+        return records, warnings
 
     try:
-        text = _load_text(path)
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as e:
+        warnings.append(f"artifact_invalid_utf8: {source} ({e})")
+        return records, warnings
     except Exception as e:
         warnings.append(f"artifact_read_error: {source} ({e})")
         return records, warnings
 
     suffix = path.suffix.lower()
     if suffix == ".jsonl":
+        nonempty_lines = [line for line in text.splitlines() if line.strip()]
+        if len(nonempty_lines) > LEAD_MAX_JSONL_RECORDS:
+            warnings.append(f"artifact_too_many_records: {source} limit={LEAD_MAX_JSONL_RECORDS}")
+            return records, warnings
         for idx, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
                 continue
             try:
                 data = json.loads(line)
+                _lead_check_json_depth(data, f"{source}:{idx}")
             except Exception as e:
                 warnings.append(f"artifact_jsonl_invalid: {source}:{idx} ({e})")
                 continue
@@ -873,6 +1025,7 @@ def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[d
     if suffix == ".json":
         try:
             parsed = json.loads(text)
+            _lead_check_json_depth(parsed, source)
         except Exception as e:
             warnings.append(f"artifact_json_invalid: {source} ({e})")
             return records, warnings
@@ -893,11 +1046,7 @@ def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[d
 
 
 def _lead_schema_candidates(root: Path) -> list[Path]:
-    # Prefer workspace-local schema, then fall back to the packaged repo schema.
-    return [
-        root / LEAD_ARTIFACT_SCHEMA_FILE,
-        Path(__file__).resolve().parents[1] / LEAD_ARTIFACT_SCHEMA_FILE,
-    ]
+    return [Path(__file__).resolve().parents[1] / LEAD_ARTIFACT_SCHEMA_FILE]
 
 
 def _lead_load_schema(root: Path) -> dict[str, Any]:
@@ -996,7 +1145,6 @@ def _lead_contract_payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _lead_validate_artifact_schema(root: Path, raw: dict[str, Any], source_ref: str) -> list[str]:
     schema = _lead_load_schema(root)
-    payload = _lead_contract_payload(raw)
 
     try:
         import jsonschema  # type: ignore
@@ -1005,8 +1153,8 @@ def _lead_validate_artifact_schema(root: Path, raw: dict[str, Any], source_ref: 
             "lead_artifact_schema_dependency_missing: jsonschema is required; install requirements-cli.txt"
         ) from e
 
-    validator = jsonschema.Draft202012Validator(schema)
-    errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
+    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
+    errors = sorted(validator.iter_errors(raw), key=lambda e: list(e.path))
     out: list[str] = []
     for err in errors:
         if err.path:
@@ -1014,6 +1162,8 @@ def _lead_validate_artifact_schema(root: Path, raw: dict[str, Any], source_ref: 
         else:
             ptr = "$"
         out.append(f"lead_artifact_schema_invalid: {source_ref} at {ptr} ({err.message})")
+    for finding in _lead_secret_findings(raw):
+        out.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
     return out
 
 
@@ -1145,7 +1295,12 @@ def _lead_extract_git_state(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _lead_normalize_artifact(raw: dict[str, Any], source_ref: str, index: int) -> dict[str, Any]:
+def _lead_normalize_artifact(
+    raw: dict[str, Any],
+    source_ref: str,
+    index: int,
+    source_sha256: str,
+) -> dict[str, Any]:
     claims = _lead_extract_claims(raw)
     decisions = _lead_extract_decisions(raw)
     open_loops = _lead_extract_open_loops(raw)
@@ -1172,6 +1327,8 @@ def _lead_normalize_artifact(raw: dict[str, Any], source_ref: str, index: int) -
         "run_id": run_id,
         "timestamp": timestamp,
         "source_artifact": source_ref,
+        "source_sha256": source_sha256,
+        "source_authentication": "asserted",
         "task": task or None,
         "adapter": adapter or None,
         "files_touched": _lead_extract_files_touched(raw),
@@ -1193,7 +1350,7 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
         out = []
         for p in explicit:
             path = p if p.is_absolute() else (root / p)
-            out.append(path.resolve())
+            out.append(_require_path_within(path, root, "artifact_path_outside_workspace"))
         unique = sorted({str(p): p for p in out}.values(), key=lambda p: str(p).lower())
         return unique
 
@@ -1203,7 +1360,8 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
     resolved = root / ".agentmd" / "resolved-context.json"
     if resolved.exists():
         discovered.append(resolved)
-    unique = sorted({str(p.resolve()): p.resolve() for p in discovered}.values(), key=lambda p: str(p).lower())
+    contained = [_require_path_within(p, root, "artifact_path_outside_workspace") for p in discovered]
+    unique = sorted({str(p): p for p in contained}.values(), key=lambda p: str(p).lower())
     return unique
 
 
@@ -1251,6 +1409,7 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
 
     claim_statuses: dict[str, set[str]] = {}
     claim_original: dict[str, str] = {}
+    claim_provenance: dict[str, list[dict[str, Any]]] = {}
     true_claims: list[str] = []
     unverified_claims: list[str] = []
     contradictions: list[str] = []
@@ -1264,6 +1423,15 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
             key = text.lower()
             claim_statuses.setdefault(key, set()).add(status)
             claim_original.setdefault(key, text)
+            claim_provenance.setdefault(key, []).append(
+                {
+                    "run_id": artifact.get("run_id"),
+                    "source_artifact": artifact.get("source_artifact"),
+                    "source_sha256": artifact.get("source_sha256"),
+                    "source_authentication": artifact.get("source_authentication", "asserted"),
+                    "asserted_status": status,
+                }
+            )
             if status == "verified":
                 true_claims.append(text)
             elif status in {"unverified", "unknown"}:
@@ -1335,6 +1503,7 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
     packet = {
         "version": "0.2",
         "primitive": "ai_work_lead",
+        "input_trust": "untrusted",
         "task": task,
         "artifacts_ingested": len(artifacts_sorted),
         "artifact_sources": sorted({str(a.get("source_artifact") or "") for a in artifacts_sorted if a.get("source_artifact")}),
@@ -1348,12 +1517,29 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
             "open_loops": open_loops,
             "next_clean_action": next_clean_action,
         },
+        "provenance": {
+            "claims": {
+                claim_original[key]: sorted(
+                    claim_provenance[key],
+                    key=lambda item: (
+                        str(item.get("run_id") or ""),
+                        str(item.get("source_artifact") or ""),
+                    ),
+                )
+                for key in sorted(claim_provenance)
+            }
+        },
         "proof": {
             "run_id": latest.get("run_id"),
             "timestamp": latest.get("timestamp"),
             "context_bundle_hash": latest_context_bundle_hash,
             "receipt_hash": latest_receipt_hash,
             "source_artifacts": sorted({str(a.get("source_artifact") or "") for a in artifacts_sorted if a.get("source_artifact")}),
+            "source_artifact_hashes": {
+                str(a.get("source_artifact")): str(a.get("source_sha256"))
+                for a in artifacts_sorted
+                if a.get("source_artifact") and a.get("source_sha256")
+            },
             "git_state": {
                 "available": latest_git_state.get("available"),
                 "commit": latest_git_state.get("commit"),
@@ -1375,6 +1561,12 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
     return packet
 
 
+def _markdown_untrusted(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", text)
+
+
 def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     current = packet.get("current_state", {})
     proof = packet.get("proof", {})
@@ -1383,7 +1575,7 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     def lines_for_list(title: str, items: list[str]) -> list[str]:
         out = [f"## {title}"]
         if items:
-            out.extend([f"- {item}" for item in items])
+            out.extend([f"- {_markdown_untrusted(item)}" for item in items])
         else:
             out.append("- none")
         out.append("")
@@ -1392,7 +1584,7 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     md: list[str] = [
         "# Sticky Current State",
         "",
-        f"Task: {packet.get('task')}",
+        f"Task: {_markdown_untrusted(packet.get('task'))}",
         f"Deterministic Hash: {packet.get('deterministic_hash')}",
         f"Artifacts Ingested: {packet.get('artifacts_ingested')}",
         "",
@@ -1408,13 +1600,13 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     open_loops = current.get("open_loops", [])
     if open_loops:
         for loop in open_loops:
-            md.append(f"- {loop.get('text')} ({loop.get('status')})")
+            md.append(f"- {_markdown_untrusted(loop.get('text'))} ({_markdown_untrusted(loop.get('status'))})")
     else:
         md.append("- none")
     md.append("")
 
     md.append("## Next Clean Action")
-    md.append(f"- {current.get('next_clean_action')}")
+    md.append(f"- {_markdown_untrusted(current.get('next_clean_action'))}")
     md.append("")
 
     md.append("## Proof")
@@ -1439,19 +1631,227 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     return "\n".join(md).rstrip() + "\n"
 
 
+def _lead_trust_source(artifact: dict[str, Any]) -> str:
+    source = str(artifact.get("adapter") or "").strip()
+    if source:
+        return source
+    source = str(artifact.get("source_artifact") or "").strip()
+    return source or "unknown"
+
+
+def _lead_empty_trust_counts() -> dict[str, int]:
+    return {"confirmed_claims": 0, "contradicted_claims": 0, "unverified_claims": 0}
+
+
+def _lead_count_artifact_trust(artifact: dict[str, Any]) -> dict[str, int]:
+    counts = _lead_empty_trust_counts()
+    contradicted_seen: set[str] = set()
+    for claim in artifact.get("claims_made", []):
+        text = str(claim.get("text") or "").strip()
+        status = _lead_status(claim.get("verification_status"))
+        if status == "verified":
+            counts["confirmed_claims"] += 1
+        elif status == "contradicted":
+            counts["contradicted_claims"] += 1
+            if text:
+                contradicted_seen.add(text.lower())
+        elif status in {"unverified", "unknown"}:
+            counts["unverified_claims"] += 1
+
+    for contradiction in artifact.get("contradictions", []):
+        text = str(contradiction or "").strip().lower()
+        if text and text not in contradicted_seen:
+            counts["contradicted_claims"] += 1
+            contradicted_seen.add(text)
+    return counts
+
+
+def _lead_trust_weight(counts: dict[str, int]) -> float:
+    confirmed = int(counts.get("confirmed_claims") or 0)
+    contradicted = int(counts.get("contradicted_claims") or 0)
+    unverified = int(counts.get("unverified_claims") or 0)
+    denominator = confirmed + contradicted + unverified + 2
+    return round((confirmed + 1) / denominator, 4)
+
+
+def _receipt_hash_matches(receipt: dict[str, Any]) -> bool:
+    claimed_hash = str(receipt.get("receipt_hash") or "")
+    if not re.fullmatch(r"[a-f0-9]{64}", claimed_hash):
+        return False
+    material_receipt = dict(receipt)
+    material_receipt.pop("receipt_hash", None)
+    material = json.dumps(material_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(material).hexdigest() == claimed_hash
+
+
+def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    receipts_dir = root / ".sticky" / "receipts"
+    if not receipts_dir.exists():
+        return None, []
+
+    warnings: list[str] = []
+    for path in reversed(sorted(receipts_dir.glob("*.jsonl"))):
+        try:
+            lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            warnings.append(f"receipt_history_unreadable: {_display_path(root, path)}")
+            continue
+        for line in reversed(lines):
+            try:
+                receipt = json.loads(line)
+            except json.JSONDecodeError:
+                warnings.append(f"receipt_history_invalid_json: {_display_path(root, path)}")
+                continue
+            if not isinstance(receipt, dict) or not _receipt_hash_matches(receipt):
+                warnings.append(f"receipt_history_hash_mismatch: {_display_path(root, path)}")
+                continue
+            return receipt, warnings
+    return None, warnings
+
+
+def _lead_latest_trust_history(
+    root: Path,
+) -> tuple[dict[str, dict[str, Any]], set[str], str | None, list[str]]:
+    receipt, warnings = _lead_latest_valid_receipt(root)
+    if receipt is None:
+        return {}, set(), None, warnings
+    source_history = (receipt.get("trust") or {}).get("source_history")
+    if not isinstance(source_history, dict):
+        return {}, set(), str(receipt.get("receipt_hash")), warnings
+
+    history: dict[str, dict[str, Any]] = {}
+    observed_artifacts: set[str] = set()
+    for source, stats in source_history.items():
+        if not isinstance(stats, dict):
+            continue
+        source_observations = {
+            str(value)
+            for value in stats.get("observed_artifacts", [])
+            if isinstance(value, str) and value
+        }
+        observed_artifacts.update(source_observations)
+        history[str(source)] = {
+            "confirmed_claims": int(stats.get("confirmed_claims") or 0),
+            "contradicted_claims": int(stats.get("contradicted_claims") or 0),
+            "unverified_claims": int(stats.get("unverified_claims") or 0),
+            "observed_artifacts": sorted(source_observations),
+        }
+    return history, observed_artifacts, str(receipt.get("receipt_hash")), warnings
+
+
+def _lead_merge_trust_counts(base: dict[str, int], incoming: dict[str, int]) -> dict[str, int]:
+    return {
+        "confirmed_claims": int(base.get("confirmed_claims") or 0) + int(incoming.get("confirmed_claims") or 0),
+        "contradicted_claims": int(base.get("contradicted_claims") or 0) + int(incoming.get("contradicted_claims") or 0),
+        "unverified_claims": int(base.get("unverified_claims") or 0) + int(incoming.get("unverified_claims") or 0),
+    }
+
+
+def _lead_build_trust_report(
+    root: Path,
+    packet: dict[str, Any],
+) -> tuple[dict[str, Any], str | None, list[str]]:
+    current_observations: dict[str, dict[str, int]] = {}
+    current_observation_ids: dict[str, set[str]] = {}
+    entry_flags: list[dict[str, Any]] = []
+    history, observed_artifacts, previous_receipt_hash, history_warnings = _lead_latest_trust_history(root)
+    for artifact in packet.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        source = _lead_trust_source(artifact)
+        observation_id = ":".join(
+            [
+                source,
+                str(artifact.get("run_id") or ""),
+                str(artifact.get("source_sha256") or ""),
+            ]
+        )
+        if observation_id in observed_artifacts:
+            continue
+        counts = _lead_count_artifact_trust(artifact)
+        current_observations[source] = _lead_merge_trust_counts(
+            current_observations.get(source, _lead_empty_trust_counts()),
+            counts,
+        )
+        current_observation_ids.setdefault(source, set()).add(observation_id)
+
+    combined = dict(history)
+    for source, counts in current_observations.items():
+        previous = combined.get(source, _lead_empty_trust_counts())
+        merged = _lead_merge_trust_counts(previous, counts)
+        merged["observed_artifacts"] = sorted(
+            {
+                *previous.get("observed_artifacts", []),
+                *current_observation_ids.get(source, set()),
+            }
+        )
+        combined[source] = merged
+
+    source_history: dict[str, dict[str, Any]] = {}
+    for source in sorted(combined):
+        counts = combined[source]
+        source_history[source] = {
+            **counts,
+            "trust_weight": None,
+            "asserted_signal_weight": _lead_trust_weight(counts),
+            "score_status": "insufficient_authenticated_evidence",
+        }
+
+    for artifact in packet.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        source = _lead_trust_source(artifact)
+        source_stats = source_history.get(source)
+        if not source_stats:
+            continue
+        entry_flags.append(
+            {
+                "source": source,
+                "run_id": artifact.get("run_id"),
+                "trust_weight": None,
+                "asserted_signal_weight": source_stats.get("asserted_signal_weight"),
+                "flag": "unverified_source_identity",
+                "reason": "artifact source identity is asserted, not cryptographically authenticated",
+            }
+        )
+
+    return (
+        {
+            "version": TRUST_WEIGHT_VERSION,
+            "advisory_only": True,
+            "source_identity_assurance": "asserted",
+            "low_trust_threshold": TRUST_LOW_THRESHOLD,
+            "source_history": source_history,
+            "current_observations": {source: current_observations[source] for source in sorted(current_observations)},
+            "entry_flags": entry_flags,
+        },
+        previous_receipt_hash,
+        history_warnings,
+    )
+
+
 def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) -> tuple[Path, dict[str, Any]]:
     proof = packet.get("proof", {})
     git_state = proof.get("git_state", {})
     timestamp = datetime.now(timezone.utc)
+    trust, previous_receipt_hash, history_warnings = _lead_build_trust_report(root, packet)
+    validation_warnings = list((packet.get("validation") or {}).get("warnings", []))
+    validation_warnings.extend(history_warnings)
+    validation_warnings.extend(
+        f"{flag['flag']}: {flag['source']}"
+        for flag in trust.get("entry_flags", [])
+    )
     receipt = {
         "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
         "run_id": proof.get("run_id"),
         "task": packet.get("task"),
         "command_run": command_run,
+        "previous_receipt_hash": previous_receipt_hash,
         "context_bundle_hash": proof.get("context_bundle_hash"),
         "receipt_hash_source": proof.get("receipt_hash"),
         "current_state_hash": packet.get("deterministic_hash"),
         "source_artifacts": proof.get("source_artifacts", []),
+        "source_artifact_hashes": proof.get("source_artifact_hashes", {}),
         "git_commit": git_state.get("commit"),
         "git_dirty": git_state.get("dirty"),
         "git_available": git_state.get("available"),
@@ -1460,6 +1860,8 @@ def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) ->
         "untracked_files": git_state.get("untracked_files", []),
         "validation_ok": (packet.get("validation") or {}).get("ok"),
         "validation_errors": (packet.get("validation") or {}).get("errors", []),
+        "validation_warnings": sorted(set(validation_warnings)),
+        "trust": trust,
     }
     material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(material).hexdigest()
@@ -1468,7 +1870,7 @@ def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) ->
     receipts_dir.mkdir(parents=True, exist_ok=True)
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
     out_path = receipts_dir / filename
-    out_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    _atomic_write_text(out_path, json.dumps(receipt) + "\n")
     return out_path, receipt
 
 
@@ -1483,6 +1885,7 @@ def compile_lead_state(
     schema_errors: list[str] = []
     for artifact_path in _lead_collect_artifact_paths(root, artifact_paths):
         loaded_records, loaded_warnings = _lead_load_artifacts_from_file(root, artifact_path)
+        source_sha256 = _sha256_file(artifact_path) if loaded_records else ""
         warnings.extend(loaded_warnings)
         for idx, (raw, source_ref) in enumerate(loaded_records, start=1):
             if validate_artifacts:
@@ -1490,7 +1893,17 @@ def compile_lead_state(
                     schema_errors.extend(_lead_validate_artifact_schema(root, raw, source_ref))
                 except ValueError as e:
                     schema_errors.append(str(e))
-            artifacts.append(_lead_normalize_artifact(raw, source_ref=source_ref, index=idx))
+            else:
+                for finding in _lead_secret_findings(raw):
+                    schema_errors.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
+            artifacts.append(
+                _lead_normalize_artifact(
+                    raw,
+                    source_ref=source_ref,
+                    index=idx,
+                    source_sha256=source_sha256,
+                )
+            )
 
     if validate_artifacts and warnings:
         raise ValueError("; ".join(warnings))
@@ -1500,6 +1913,11 @@ def compile_lead_state(
 
     if schema_errors:
         raise ValueError("; ".join(schema_errors))
+
+    run_ids = [str(item.get("run_id") or "") for item in artifacts]
+    duplicate_run_ids = sorted({run_id for run_id in run_ids if run_id and run_ids.count(run_id) > 1})
+    if duplicate_run_ids:
+        raise ValueError(f"lead_artifact_duplicate_run_id: {duplicate_run_ids}")
 
     packet = _lead_compile_packet(root, artifacts, task_override)
     if warnings:
@@ -1514,8 +1932,8 @@ def compile_lead_state(
     sticky_dir.mkdir(parents=True, exist_ok=True)
     json_path = sticky_dir / "current-state.json"
     md_path = sticky_dir / "current-state.md"
-    json_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
-    md_path.write_text(_lead_current_state_markdown(packet), encoding="utf-8")
+    _atomic_write_text(json_path, json.dumps(packet, indent=2))
+    _atomic_write_text(md_path, _lead_current_state_markdown(packet))
 
     receipt_path, receipt = _lead_write_receipt(root, packet, command_run="agentmd lead compile")
     return packet, json_path, md_path, receipt_path, receipt

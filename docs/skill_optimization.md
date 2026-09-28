@@ -50,7 +50,9 @@ This direction maps directly onto AgentMD primitives already in place:
   - add
   - delete
   - replace
-- Validation gate: accept only when `validation_score > baseline_score`.
+- Validation gate: accept only when `validation_score > baseline_score` and a hash-verified `skill-validation.v1` receipt binds the evaluator result to the old and proposed skill hashes.
+- Skill paths are restricted to workspace-local `skills/*/SKILL.md` files; absolute paths, traversal, and symlink escapes fail closed.
+- Accepted writes are atomic and verify that the source skill did not change during validation.
 - Accepted edit path:
   - updates skill file
   - writes `.sticky/skill-receipts/*.jsonl`
@@ -58,6 +60,7 @@ This direction maps directly onto AgentMD primitives already in place:
   - does not update skill file
   - writes `.sticky/rejected-skill-edits/*.jsonl`
 - Safe failure on missing or ambiguous target.
+- Validation receipt schema: `schemas/skill-validation.schema.json`.
 
 ## Not implemented yet
 
@@ -65,3 +68,4 @@ This direction maps directly onto AgentMD primitives already in place:
 - Multi-epoch optimization loop over benchmark tasks.
 - Benchmark harness and broad evaluation suite.
 - Autonomous self-editing loop without explicit edit payloads.
+- Cryptographically authenticated evaluator identity. Current validation receipts provide integrity and binding, not asymmetric proof of origin.
