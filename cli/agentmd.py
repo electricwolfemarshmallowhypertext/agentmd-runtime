@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
 import subprocess
 import tempfile
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import typer
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 app = typer.Typer(add_completion=False, help="AgentMD context governance runtime CLI")
 lead_app = typer.Typer(add_completion=False, help="AI Work Lead primitives")
 skill_app = typer.Typer(add_completion=False, help="Skill optimization gates")
+identity_app = typer.Typer(add_completion=False, help="Durable agent identity-state primitives")
 app.add_typer(lead_app, name="lead")
 app.add_typer(skill_app, name="skill")
+app.add_typer(identity_app, name="identity")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
@@ -65,6 +74,11 @@ ADAPTER_INSTRUCTIONS = {
 LEAD_ARTIFACT_SCHEMA_FILE = "schemas/lead-artifact.schema.json"
 SKILL_EDIT_SCHEMA_FILE = "schemas/skill-edit.schema.json"
 SKILL_VALIDATION_SCHEMA_FILE = "schemas/skill-validation.schema.json"
+IDENTITY_RECORD_SCHEMA_FILE = "schemas/agent-identity.schema.json"
+IDENTITY_CHANGE_SCHEMA_FILE = "schemas/identity-change.schema.json"
+IDENTITY_ENVELOPE_SCHEMA_FILE = "schemas/identity-envelope.schema.json"
+IDENTITY_MAX_FILE_BYTES = 10_485_760
+IDENTITY_KEY_MAX_BYTES = 65_536
 TRUST_WEIGHT_VERSION = "trust-weight.v1"
 TRUST_LOW_THRESHOLD = 0.5
 LEAD_MAX_ARTIFACT_BYTES = 1_048_576
@@ -1018,6 +1032,721 @@ def _lead_secret_findings(value: Any, path: str = "$") -> list[str]:
                 findings.append(f"{path}:{name}")
     return findings
 
+
+def _identity_canonical_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _identity_hash(payload: Any) -> str:
+    return hashlib.sha256(_identity_canonical_bytes(payload)).hexdigest()
+
+
+def _identity_state_dir(root: Path) -> Path:
+    return _require_path_within(root / ".agentmd" / "identity", root, "identity_state_outside_workspace")
+
+
+def _identity_records_dir(root: Path) -> Path:
+    return _require_path_within(_identity_state_dir(root) / "records", root, "identity_state_outside_workspace")
+
+
+@contextmanager
+def _identity_write_lock(root: Path):
+    state_dir = _identity_state_dir(root)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = _require_path_within(state_dir / ".write.lock", root, "identity_lock_outside_workspace")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as e:
+        raise ValueError("identity_write_locked: another identity mutation is active") from e
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
+def _identity_validate_schema(root: Path, payload: dict[str, Any], schema_file: str, prefix: str) -> None:
+    schema = _load_json_schema(root, schema_file, f"{prefix}_schema_missing")
+    errors = _validate_json_payload(payload, schema, f"{prefix}_schema_invalid")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def _identity_private_key(path: Path) -> Ed25519PrivateKey:
+    key_path = path.expanduser()
+    if key_path.is_symlink():
+        raise ValueError("identity_signing_key_symlink_not_allowed")
+    if not key_path.exists() or not key_path.is_file():
+        raise ValueError(f"identity_signing_key_missing: {key_path}")
+    if key_path.stat().st_size > IDENTITY_KEY_MAX_BYTES:
+        raise ValueError("identity_signing_key_too_large")
+    key_bytes = key_path.read_bytes()
+    key: Any = None
+    try:
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+    except (TypeError, ValueError):
+        try:
+            key = serialization.load_ssh_private_key(key_bytes, password=None)
+        except (TypeError, ValueError) as e:
+            raise ValueError("identity_signing_key_invalid_or_encrypted") from e
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError("identity_signing_key_must_be_ed25519")
+    return key
+
+
+def _identity_signer(private_key: Ed25519PrivateKey) -> dict[str, str]:
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    fingerprint_hex = hashlib.sha256(public_bytes).hexdigest()
+    return {
+        "algorithm": "ed25519",
+        "fingerprint": f"sha256:{fingerprint_hex}",
+        "public_key": base64.b64encode(public_bytes).decode("ascii"),
+    }
+
+
+def _identity_agent_id(signer: dict[str, str]) -> str:
+    return f"agentmd:{signer['fingerprint'].split(':', 1)[1]}"
+
+
+def _identity_sign_hash(private_key: Ed25519PrivateKey, digest_hex: str) -> str:
+    return base64.b64encode(private_key.sign(bytes.fromhex(digest_hex))).decode("ascii")
+
+
+def _identity_public_key(signer: dict[str, Any]) -> Ed25519PublicKey:
+    try:
+        public_bytes = base64.b64decode(str(signer.get("public_key") or ""), validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise ValueError("identity_public_key_invalid") from e
+    if len(public_bytes) != 32:
+        raise ValueError("identity_public_key_invalid")
+    fingerprint = f"sha256:{hashlib.sha256(public_bytes).hexdigest()}"
+    if fingerprint != signer.get("fingerprint"):
+        raise ValueError("identity_signer_fingerprint_mismatch")
+    try:
+        return Ed25519PublicKey.from_public_bytes(public_bytes)
+    except ValueError as e:
+        raise ValueError("identity_public_key_invalid") from e
+
+
+def _identity_verify_hash_signature(signer: dict[str, Any], digest_hex: str, signature: Any) -> None:
+    try:
+        signature_bytes = base64.b64decode(str(signature or ""), validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise ValueError("identity_signature_invalid_encoding") from e
+    try:
+        _identity_public_key(signer).verify(signature_bytes, bytes.fromhex(digest_hex))
+    except (InvalidSignature, ValueError) as e:
+        raise ValueError("identity_signature_verification_failed") from e
+
+
+def _identity_record_material(record: dict[str, Any]) -> dict[str, Any]:
+    material = dict(record)
+    material.pop("receipt_hash", None)
+    material.pop("signature", None)
+    return material
+
+
+def _identity_verify_record(root: Path, record: dict[str, Any]) -> None:
+    _identity_validate_schema(root, record, IDENTITY_RECORD_SCHEMA_FILE, "identity_record")
+    if _lead_secret_findings(record.get("state")):
+        raise ValueError("identity_record_secret_detected")
+    if _identity_hash(record.get("state")) != record.get("state_hash"):
+        raise ValueError("identity_state_hash_mismatch")
+    receipt_hash = _identity_hash(_identity_record_material(record))
+    if receipt_hash != record.get("receipt_hash"):
+        raise ValueError("identity_receipt_hash_mismatch")
+    signer = record.get("signer")
+    if not isinstance(signer, dict):
+        raise ValueError("identity_signer_invalid")
+    if _identity_agent_id(signer) != record.get("agent_id"):
+        raise ValueError("identity_agent_id_signer_mismatch")
+    _identity_verify_hash_signature(signer, receipt_hash, record.get("signature"))
+
+
+def _identity_verify_records(
+    root: Path,
+    records: list[dict[str, Any]],
+    expected_fingerprint: str | None = None,
+) -> list[dict[str, Any]]:
+    if not records:
+        raise ValueError("identity_not_initialized")
+    first_agent_id: str | None = None
+    first_fingerprint: str | None = None
+    previous: dict[str, Any] | None = None
+    for expected_version, record in enumerate(records, start=1):
+        _identity_verify_record(root, record)
+        signer = record["signer"]
+        if record["version"] != expected_version:
+            raise ValueError("identity_version_sequence_invalid")
+        if first_agent_id is None:
+            first_agent_id = str(record["agent_id"])
+            first_fingerprint = str(signer["fingerprint"])
+            if record["event"] != "init":
+                raise ValueError("identity_first_record_not_init")
+            if record["previous_state_hash"] is not None or record["previous_receipt_hash"] is not None:
+                raise ValueError("identity_first_record_has_previous_hash")
+        else:
+            assert previous is not None
+            if record["agent_id"] != first_agent_id or signer["fingerprint"] != first_fingerprint:
+                raise ValueError("identity_signer_changed")
+            if record["event"] == "init":
+                raise ValueError("identity_duplicate_init")
+            if record["previous_state_hash"] != previous["state_hash"]:
+                raise ValueError("identity_previous_state_hash_mismatch")
+            if record["previous_receipt_hash"] != previous["receipt_hash"]:
+                raise ValueError("identity_previous_receipt_hash_mismatch")
+        if record["event"] == "rollback" and record["target_version"] is None:
+            raise ValueError("identity_rollback_target_missing")
+        if record["event"] != "rollback" and record["target_version"] is not None:
+            raise ValueError("identity_target_version_unexpected")
+        previous = record
+    if expected_fingerprint is not None and first_fingerprint != expected_fingerprint:
+        raise ValueError("identity_signer_fingerprint_mismatch")
+    return records
+
+
+def _identity_load_record_file(root: Path, path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("identity_record_symlink_not_allowed")
+    path = _require_path_within(path, root, "identity_record_outside_workspace")
+    if path.stat().st_size > IDENTITY_MAX_FILE_BYTES:
+        raise ValueError(f"identity_record_too_large: {_display_path(root, path)}")
+    try:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"identity_record_invalid_json: {_display_path(root, path)}") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"identity_record_invalid_shape: {_display_path(root, path)}")
+    return payload
+
+
+def _identity_load_records(root: Path, expected_fingerprint: str | None = None) -> list[dict[str, Any]]:
+    records_dir = _identity_records_dir(root)
+    if not records_dir.exists():
+        return []
+    paths = sorted(records_dir.glob("*.json"))
+    records = [_identity_load_record_file(root, path) for path in paths]
+    if records:
+        _identity_verify_records(root, records, expected_fingerprint=expected_fingerprint)
+    return records
+
+
+def _identity_write_record(root: Path, record: dict[str, Any]) -> Path:
+    records_dir = _identity_records_dir(root)
+    records_dir.mkdir(parents=True, exist_ok=True)
+    path = _require_path_within(
+        records_dir / f"{int(record['version']):08d}.json",
+        root,
+        "identity_record_outside_workspace",
+    )
+    if path.exists():
+        raise ValueError(f"identity_version_already_exists: {record['version']}")
+    _atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _identity_build_record(
+    root: Path,
+    private_key: Ed25519PrivateKey,
+    state: dict[str, Any],
+    version: int,
+    event: str,
+    previous: dict[str, Any] | None,
+    summary: str,
+    change_id: str | None = None,
+    target_version: int | None = None,
+    requested_by: str | None = None,
+    approved_by: str | None = None,
+) -> dict[str, Any]:
+    signer = _identity_signer(private_key)
+    record: dict[str, Any] = {
+        "schema_version": "agent-identity.v1",
+        "agent_id": _identity_agent_id(signer),
+        "version": version,
+        "event": event,
+        "timestamp": _utc_now_iso(),
+        "state": state,
+        "state_hash": _identity_hash(state),
+        "previous_state_hash": previous.get("state_hash") if previous else None,
+        "previous_receipt_hash": previous.get("receipt_hash") if previous else None,
+        "change_id": change_id,
+        "summary": summary,
+        "target_version": target_version,
+        "requested_by": requested_by,
+        "approved_by": approved_by,
+        "signer": signer,
+    }
+    record["receipt_hash"] = _identity_hash(record)
+    record["signature"] = _identity_sign_hash(private_key, record["receipt_hash"])
+    _identity_verify_record(root, record)
+    return record
+
+
+def _identity_read_workspace_json(root: Path, path: Path, prefix: str) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"{prefix}_symlink_not_allowed")
+    path = _require_path_within(path, root, f"{prefix}_outside_workspace")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"{prefix}_missing: {_display_path(root, path)}")
+    if path.stat().st_size > IDENTITY_MAX_FILE_BYTES:
+        raise ValueError(f"{prefix}_too_large")
+    try:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"{prefix}_invalid_json") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"{prefix}_invalid_shape")
+    if _lead_json_depth(payload) > LEAD_MAX_JSON_DEPTH:
+        raise ValueError(f"{prefix}_too_deep")
+    return payload
+
+
+def _identity_load_change(root: Path, path: Path) -> dict[str, Any]:
+    change = _identity_read_workspace_json(root, path, "identity_change")
+    _identity_validate_schema(root, change, IDENTITY_CHANGE_SCHEMA_FILE, "identity_change")
+    findings = _lead_secret_findings(change)
+    if findings:
+        raise ValueError("identity_change_secret_detected: " + ", ".join(sorted(findings)))
+    return change
+
+
+def _identity_apply_operations(state: dict[str, Any], operations: list[dict[str, Any]]) -> dict[str, Any]:
+    updated = json.loads(json.dumps(state))
+    seen_paths: set[str] = set()
+    for operation in operations:
+        op = str(operation.get("op"))
+        path = str(operation.get("path"))
+        if path in seen_paths:
+            raise ValueError(f"identity_change_duplicate_path: {path}")
+        seen_paths.add(path)
+        has_value = "value" in operation
+        if op in {"add", "replace"} and not has_value:
+            raise ValueError(f"identity_change_value_required: {path}")
+        if op == "remove" and has_value:
+            raise ValueError(f"identity_change_remove_value_forbidden: {path}")
+
+        if path in {"/name", "/purpose"}:
+            if op != "replace":
+                raise ValueError(f"identity_change_operation_not_allowed: {op} {path}")
+            value = operation["value"]
+            if not isinstance(value, str) or (path == "/name" and not value.strip()):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            updated[path[1:]] = value.strip() if path == "/name" else value
+            continue
+
+        if path in {"/operating_principles", "/boundaries"}:
+            if op != "replace":
+                raise ValueError(f"identity_change_operation_not_allowed: {op} {path}")
+            value = operation["value"]
+            if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            updated[path[1:]] = value
+            continue
+
+        parts = path.strip("/").split("/", 1)
+        if len(parts) != 2 or parts[0] not in {"working_style", "user_preferences"}:
+            raise ValueError(f"identity_change_path_invalid: {path}")
+        collection = updated[parts[0]]
+        key = parts[1]
+        exists = key in collection
+        if op == "add":
+            if exists:
+                raise ValueError(f"identity_change_add_target_exists: {path}")
+            value = operation["value"]
+            if not isinstance(value, str):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            collection[key] = value
+        elif op == "replace":
+            if not exists:
+                raise ValueError(f"identity_change_replace_target_missing: {path}")
+            value = operation["value"]
+            if not isinstance(value, str):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            collection[key] = value
+        elif op == "remove":
+            if not exists:
+                raise ValueError(f"identity_change_remove_target_missing: {path}")
+            del collection[key]
+        else:
+            raise ValueError(f"identity_change_operation_invalid: {op}")
+
+    if _lead_secret_findings(updated):
+        raise ValueError("identity_state_secret_detected")
+    return updated
+
+
+def _identity_key_matches_record(private_key: Ed25519PrivateKey, record: dict[str, Any]) -> None:
+    signer = _identity_signer(private_key)
+    if signer["fingerprint"] != record["signer"]["fingerprint"]:
+        raise ValueError("identity_signing_key_mismatch")
+
+
+def _identity_command_error(error: ValueError, json_output: bool) -> None:
+    if json_output:
+        typer.echo(json.dumps({"ok": False, "error": str(error)}))
+    else:
+        typer.echo(str(error))
+    raise typer.Exit(code=1)
+
+
+@identity_app.command("init")
+def identity_init(
+    name: str = typer.Option(..., "--name", help="Human-readable agent name"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    purpose: str = typer.Option("", "--purpose", help="Stable identity purpose"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            if _identity_load_records(root):
+                raise ValueError("identity_already_initialized")
+            state = {
+                "name": name.strip(),
+                "purpose": purpose,
+                "working_style": {},
+                "user_preferences": {},
+                "operating_principles": [],
+                "boundaries": [],
+            }
+            if _lead_secret_findings(state):
+                raise ValueError("identity_state_secret_detected")
+            record = _identity_build_record(
+                root,
+                private_key,
+                state,
+                version=1,
+                event="init",
+                previous=None,
+                summary="Initialize durable agent identity.",
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "fingerprint": record["signer"]["fingerprint"],
+        "version": record["version"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("verify")
+def identity_verify(
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    trust_fingerprint: str | None = typer.Option(None, "--trust-fingerprint", help="Expected sha256 public-key fingerprint"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root, expected_fingerprint=trust_fingerprint)
+        if not records:
+            raise ValueError("identity_not_initialized")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    latest = records[-1]
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "version": latest["version"],
+        "state_hash": latest["state_hash"],
+        "state": latest["state"],
+        "receipt_hash": latest["receipt_hash"],
+        "assurance": "trusted" if trust_fingerprint else "self_consistent",
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("history")
+def identity_history(
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root)
+        if not records:
+            raise ValueError("identity_not_initialized")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    history = [
+        {
+            "version": record["version"],
+            "event": record["event"],
+            "timestamp": record["timestamp"],
+            "summary": record["summary"],
+            "change_id": record["change_id"],
+            "target_version": record["target_version"],
+            "state_hash": record["state_hash"],
+            "receipt_hash": record["receipt_hash"],
+            "previous_receipt_hash": record["previous_receipt_hash"],
+            "requested_by": record["requested_by"],
+            "approved_by": record["approved_by"],
+        }
+        for record in records
+    ]
+    if json_output:
+        typer.echo(json.dumps(history, indent=2))
+    else:
+        for item in history:
+            typer.echo(
+                f"version={item['version']} event={item['event']} "
+                f"receipt_hash={item['receipt_hash']} summary={item['summary']}"
+            )
+
+
+@identity_app.command("apply")
+def identity_apply(
+    change: Path = typer.Option(..., "--change", help="Identity change proposal JSON within the workspace"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            records = _identity_load_records(root)
+            if not records:
+                raise ValueError("identity_not_initialized")
+            latest = records[-1]
+            _identity_key_matches_record(private_key, latest)
+            proposal = _identity_load_change(root, change)
+            if proposal["agent_id"] != latest["agent_id"]:
+                raise ValueError("identity_change_agent_id_mismatch")
+            if proposal["from_version"] != latest["version"]:
+                raise ValueError("identity_change_version_mismatch")
+            state = _identity_apply_operations(latest["state"], proposal["operations"])
+            record = _identity_build_record(
+                root,
+                private_key,
+                state,
+                version=int(latest["version"]) + 1,
+                event="change",
+                previous=latest,
+                summary=proposal["summary"],
+                change_id=proposal["change_id"],
+                requested_by=proposal["requested_by"],
+                approved_by=proposal["approved_by"],
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "version": record["version"],
+        "state_hash": record["state_hash"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("rollback")
+def identity_rollback(
+    version: int = typer.Option(..., "--version", min=1, help="Historical identity version to restore"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    requested_by: str | None = typer.Option(None, "--requested-by"),
+    approved_by: str | None = typer.Option(None, "--approved-by"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            records = _identity_load_records(root)
+            if not records:
+                raise ValueError("identity_not_initialized")
+            latest = records[-1]
+            _identity_key_matches_record(private_key, latest)
+            if version >= int(latest["version"]):
+                raise ValueError("identity_rollback_target_must_be_historical")
+            target = next((record for record in records if record["version"] == version), None)
+            if target is None:
+                raise ValueError("identity_rollback_target_missing")
+            record = _identity_build_record(
+                root,
+                private_key,
+                json.loads(json.dumps(target["state"])),
+                version=int(latest["version"]) + 1,
+                event="rollback",
+                previous=latest,
+                summary=f"Rollback identity state to version {version}.",
+                target_version=version,
+                requested_by=requested_by,
+                approved_by=approved_by,
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "version": record["version"],
+        "target_version": version,
+        "state_hash": record["state_hash"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+def _identity_envelope_material(envelope: dict[str, Any]) -> dict[str, Any]:
+    material = dict(envelope)
+    material.pop("envelope_hash", None)
+    material.pop("signature", None)
+    return material
+
+
+@identity_app.command("export")
+def identity_export(
+    output: Path = typer.Option(..., "--output", help="Signed identity export path within the workspace"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root)
+        if not records:
+            raise ValueError("identity_not_initialized")
+        latest = records[-1]
+        private_key = _identity_private_key(signing_key)
+        _identity_key_matches_record(private_key, latest)
+        output_path = _require_path_within(output, root, "identity_export_outside_workspace")
+        envelope: dict[str, Any] = {
+            "schema_version": "identity-envelope.v1",
+            "agent_id": latest["agent_id"],
+            "exported_at": _utc_now_iso(),
+            "record_count": len(records),
+            "latest_version": latest["version"],
+            "latest_receipt_hash": latest["receipt_hash"],
+            "signer": latest["signer"],
+            "records": records,
+        }
+        envelope["envelope_hash"] = _identity_hash(envelope)
+        envelope["signature"] = _identity_sign_hash(private_key, envelope["envelope_hash"])
+        _identity_validate_schema(root, envelope, IDENTITY_ENVELOPE_SCHEMA_FILE, "identity_envelope")
+        _atomic_write_text(output_path, json.dumps(envelope, indent=2, sort_keys=True) + "\n")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "version": latest["version"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "envelope_hash": envelope["envelope_hash"],
+        "output": _display_path(root, output_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("import")
+def identity_import(
+    input_path: Path = typer.Option(..., "--input", help="Signed identity export within the workspace"),
+    trust_fingerprint: str = typer.Option(..., "--trust-fingerprint", help="Expected sha256 public-key fingerprint"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        envelope = _identity_read_workspace_json(root, input_path, "identity_import")
+        _identity_validate_schema(root, envelope, IDENTITY_ENVELOPE_SCHEMA_FILE, "identity_envelope")
+        envelope_hash = _identity_hash(_identity_envelope_material(envelope))
+        if envelope_hash != envelope.get("envelope_hash"):
+            raise ValueError("identity_envelope_hash_mismatch")
+        signer = envelope.get("signer")
+        if not isinstance(signer, dict):
+            raise ValueError("identity_signer_invalid")
+        if signer.get("fingerprint") != trust_fingerprint:
+            raise ValueError("identity_signer_fingerprint_mismatch")
+        _identity_verify_hash_signature(signer, envelope_hash, envelope.get("signature"))
+        raw_records = envelope.get("records")
+        if not isinstance(raw_records, list) or not all(isinstance(item, dict) for item in raw_records):
+            raise ValueError("identity_envelope_records_invalid")
+        records = _identity_verify_records(root, list(raw_records), expected_fingerprint=trust_fingerprint)
+        latest = records[-1]
+        if envelope["agent_id"] != latest["agent_id"]:
+            raise ValueError("identity_envelope_agent_id_mismatch")
+        if envelope["record_count"] != len(records):
+            raise ValueError("identity_envelope_record_count_mismatch")
+        if envelope["latest_version"] != latest["version"]:
+            raise ValueError("identity_envelope_latest_version_mismatch")
+        if envelope["latest_receipt_hash"] != latest["receipt_hash"]:
+            raise ValueError("identity_envelope_latest_receipt_mismatch")
+        if envelope["signer"] != latest["signer"]:
+            raise ValueError("identity_envelope_signer_mismatch")
+
+        imported_records = 0
+        with _identity_write_lock(root):
+            existing = _identity_load_records(root, expected_fingerprint=trust_fingerprint)
+            if len(existing) > len(records):
+                raise ValueError("identity_import_would_rewind_history")
+            for index, current in enumerate(existing):
+                if current["receipt_hash"] != records[index]["receipt_hash"]:
+                    raise ValueError("identity_import_history_conflict")
+            for record in records[len(existing):]:
+                _identity_write_record(root, record)
+                imported_records += 1
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "version": latest["version"],
+        "receipt_hash": latest["receipt_hash"],
+        "imported_records": imported_records,
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
 
 def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[dict[str, Any], str]], list[str]]:
     records: list[tuple[dict[str, Any], str]] = []

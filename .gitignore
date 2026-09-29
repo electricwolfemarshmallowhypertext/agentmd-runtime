@@ -24,3 +24,4 @@ data/
 
 # Local audit planning
 TODO.local.md
+.agentmd/identity/

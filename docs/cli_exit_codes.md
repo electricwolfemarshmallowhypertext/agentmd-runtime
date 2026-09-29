@@ -56,3 +56,17 @@ Notes:
 Notes:
 
 - `skill apply-edit` uses error code `1` for domain failures and disambiguates by message code.
+
+## identity
+
+Applies to `identity init`, `verify`, `history`, `apply`, `rollback`, `export`,
+and `import`.
+
+- Success: `0`.
+- Validation, schema, signature, trust, corruption, conflict, or missing-file failure: `1`.
+- Usage error: `2` for missing or invalid CLI arguments.
+- Internal error: `1`.
+
+Identity domain failures use explicit messages such as
+`identity_signature_verification_failed`,
+`identity_signer_fingerprint_mismatch`, and `identity_import_history_conflict`.

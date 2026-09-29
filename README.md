@@ -32,6 +32,7 @@ It compiles scattered AI/tool runs into one verified current-state packet, with 
 - `docs/determinism.md`
 - `docs/receipt_integrity.md`
 - `docs/threat_model.md`
+- `docs/identity_state.md`
 - `SECURITY.md`
 
 ## Problem
@@ -106,6 +107,24 @@ Scope intentionally not implemented yet:
 - multi-epoch benchmark loop
 - autonomous self-editing runtime
 
+## Durable Agent Identity
+
+AgentMD can preserve a continuing agent identity separately from the current
+state of work. Identity versions are immutable, hash-chained, and signed with
+an external Ed25519 key that AgentMD never stores.
+
+- Commands: `agentmd identity init|verify|history|apply|rollback|export|import`
+- Schemas: `agent-identity.v1`, `identity-change.v1`, and `identity-envelope.v1`
+- Storage: `.agentmd/identity/records/*.json`
+- Rollback appends a new signed version; it never deletes history
+- Export/import uses a signed envelope and requires explicit fingerprint trust
+- Identity changes are schema-validated, secret-scanned, and atomically written
+
+Identity answers "which continuing agent is this?" The AI Work Lead packet
+continues to answer "what is currently true about the work?" The two states
+remain separate. See `docs/identity_state.md` for the trust model and key
+custody requirements.
+
 ## Core Commands
 
 ```powershell
@@ -115,6 +134,8 @@ Scope intentionally not implemented yet:
 .\agentmd.cmd run --adapter codex --task "review this repo for context drift"
 .\agentmd.cmd lead compile --task "compile ai work lead state" --artifact examples/lead-artifacts/run-codex.jsonl --artifact examples/lead-artifacts/run-claude.json --artifact examples/lead-artifacts/run-gemini.jsonl
 .\agentmd.cmd skill apply-edit --edit edits/validated-skill-edit.json
+.\agentmd.cmd identity verify --trust-fingerprint "sha256:<trusted-fingerprint>"
+.\agentmd.cmd identity history
 ```
 
 ## Quickstart

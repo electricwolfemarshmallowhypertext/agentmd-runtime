@@ -4,10 +4,14 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 
 import pytest
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from typer.testing import CliRunner
 
@@ -1314,3 +1318,175 @@ def test_lead_compile_rejects_additional_provider_secrets(ws: Path) -> None:
         assert result.exit_code == 1
         assert "lead_artifact_secret_detected" in result.stdout
         assert secret not in result.stdout
+
+
+def write_identity_signing_key(path: Path) -> Path:
+    key = Ed25519PrivateKey.generate()
+    path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    return path
+
+
+def init_identity(root: Path, key_path: Path) -> dict[str, object]:
+    result = runner.invoke(
+        app,
+        [
+            "identity", "init", "--root", str(root), "--name", "Continuing Agent",
+            "--purpose", "Preserve verified identity continuity", "--signing-key", str(key_path), "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    return json.loads(result.stdout)
+
+
+def valid_identity_change(agent_id: str, from_version: int, **overrides: object) -> dict[str, object]:
+    change: dict[str, object] = {
+        "schema_version": "identity-change.v1",
+        "change_id": f"identity-change-{from_version}",
+        "agent_id": agent_id,
+        "from_version": from_version,
+        "summary": "Record a durable working-style preference.",
+        "operations": [{"op": "add", "path": "/working_style/tone", "value": "direct"}],
+        "requested_by": "test-suite",
+        "approved_by": "human-test",
+        "timestamp": "2026-09-29T20:00:00Z",
+    }
+    change.update(overrides)
+    return change
+
+
+def test_identity_survives_restart_and_verifies(ws: Path) -> None:
+    key_path = write_identity_signing_key(ws / "identity-key.pem")
+    created = init_identity(ws, key_path)
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "cli.agentmd", "identity", "verify",
+            "--root", str(ws), "--trust-fingerprint", str(created["fingerprint"]), "--json",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    verified = json.loads(result.stdout)
+    assert verified["ok"] is True
+    assert verified["agent_id"] == created["agent_id"]
+    assert verified["version"] == 1
+    assert verified["assurance"] == "trusted"
+    assert verified["state"]["name"] == "Continuing Agent"
+
+
+def test_identity_export_import_preserves_signed_chain(ws: Path) -> None:
+    source = ws / "source"
+    destination = ws / "destination"
+    source.mkdir()
+    destination.mkdir()
+    key_path = write_identity_signing_key(ws / "identity-key.pem")
+    created = init_identity(source, key_path)
+    export_path = source / "identity-export.json"
+
+    exported = runner.invoke(
+        app,
+        ["identity", "export", "--root", str(source), "--output", str(export_path), "--signing-key", str(key_path)],
+    )
+    assert exported.exit_code == 0, exported.stdout
+    imported_path = destination / "identity-export.json"
+    shutil.copyfile(export_path, imported_path)
+
+    wrong = runner.invoke(
+        app,
+        ["identity", "import", "--root", str(destination), "--input", str(imported_path), "--trust-fingerprint", "sha256:" + "0" * 64],
+    )
+    assert wrong.exit_code == 1
+    assert "identity_signer_fingerprint_mismatch" in wrong.stdout
+    assert not (destination / ".agentmd" / "identity" / "records").exists()
+
+    imported = runner.invoke(
+        app,
+        ["identity", "import", "--root", str(destination), "--input", str(imported_path), "--trust-fingerprint", str(created["fingerprint"]), "--json"],
+    )
+    assert imported.exit_code == 0, imported.stdout
+    payload = json.loads(imported.stdout)
+    assert payload["agent_id"] == created["agent_id"]
+    assert payload["version"] == 1
+    assert payload["imported_records"] == 1
+
+
+def test_identity_invalid_change_writes_nothing(ws: Path) -> None:
+    key_path = write_identity_signing_key(ws / "identity-key.pem")
+    created = init_identity(ws, key_path)
+    secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+    change_path = ws / "identity-change.json"
+    change_path.write_text(
+        json.dumps(
+            valid_identity_change(
+                str(created["agent_id"]),
+                1,
+                operations=[{"op": "add", "path": "/user_preferences/api", "value": secret}],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["identity", "apply", "--root", str(ws), "--change", str(change_path), "--signing-key", str(key_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "identity_change_secret_detected" in result.stdout
+    assert secret not in result.stdout
+    assert len(list((ws / ".agentmd" / "identity" / "records").glob("*.json"))) == 1
+
+
+def test_identity_rollback_is_append_only(ws: Path) -> None:
+    key_path = write_identity_signing_key(ws / "identity-key.pem")
+    created = init_identity(ws, key_path)
+    change_path = ws / "identity-change.json"
+    change_path.write_text(json.dumps(valid_identity_change(str(created["agent_id"]), 1)), encoding="utf-8")
+
+    applied = runner.invoke(
+        app,
+        ["identity", "apply", "--root", str(ws), "--change", str(change_path), "--signing-key", str(key_path)],
+    )
+    assert applied.exit_code == 0, applied.stdout
+    rolled_back = runner.invoke(
+        app,
+        ["identity", "rollback", "--root", str(ws), "--version", "1", "--signing-key", str(key_path)],
+    )
+    assert rolled_back.exit_code == 0, rolled_back.stdout
+
+    history_result = runner.invoke(app, ["identity", "history", "--root", str(ws), "--json"])
+    assert history_result.exit_code == 0, history_result.stdout
+    history = json.loads(history_result.stdout)
+    assert [item["version"] for item in history] == [1, 2, 3]
+    assert history[-1]["event"] == "rollback"
+    assert history[-1]["target_version"] == 1
+    records = sorted((ws / ".agentmd" / "identity" / "records").glob("*.json"))
+    assert len(records) == 3
+
+
+def test_identity_corruption_fails_closed(ws: Path) -> None:
+    key_path = write_identity_signing_key(ws / "identity-key.pem")
+    created = init_identity(ws, key_path)
+    record_path = ws / ".agentmd" / "identity" / "records" / "00000001.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["state"]["name"] = "Impostor"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["identity", "verify", "--root", str(ws), "--trust-fingerprint", str(created["fingerprint"]), "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert "identity_state_hash_mismatch" in result.stdout
+    assert len(list((ws / ".agentmd" / "identity" / "records").glob("*.json"))) == 1

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmd.dev/schemas/agent-identity.schema.json",
+  "title": "AgentMD Signed Identity Record",
+  "type": "object",
+  "required": [
+    "schema_version", "agent_id", "version", "event", "timestamp",
+    "state", "state_hash", "previous_state_hash", "previous_receipt_hash",
+    "change_id", "summary", "target_version", "requested_by", "approved_by",
+    "signer", "receipt_hash", "signature"
+  ],
+  "properties": {
+    "schema_version": {"const": "agent-identity.v1"},
+    "agent_id": {"type": "string", "pattern": "^agentmd:[a-f0-9]{64}$"},
+    "version": {"type": "integer", "minimum": 1},
+    "event": {"type": "string", "enum": ["init", "change", "rollback"]},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 64},
+    "state": {
+      "type": "object",
+      "required": ["name", "purpose", "working_style", "user_preferences", "operating_principles", "boundaries"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "purpose": {"type": "string", "maxLength": 16384},
+        "working_style": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {"pattern": "^[A-Za-z0-9_.-]{1,128}$"},
+          "additionalProperties": {"type": "string", "maxLength": 8192}
+        },
+        "user_preferences": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {"pattern": "^[A-Za-z0-9_.-]{1,128}$"},
+          "additionalProperties": {"type": "string", "maxLength": 8192}
+        },
+        "operating_principles": {
+          "type": "array", "maxItems": 128,
+          "items": {"type": "string", "minLength": 1, "maxLength": 8192}
+        },
+        "boundaries": {
+          "type": "array", "maxItems": 128,
+          "items": {"type": "string", "minLength": 1, "maxLength": 8192}
+        }
+      },
+      "additionalProperties": false
+    },
+    "state_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "previous_state_hash": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+    "previous_receipt_hash": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+    "change_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+    "summary": {"type": "string", "maxLength": 4096},
+    "target_version": {"type": ["integer", "null"], "minimum": 1},
+    "requested_by": {"type": ["string", "null"], "maxLength": 256},
+    "approved_by": {"type": ["string", "null"], "maxLength": 256},
+    "signer": {
+      "type": "object",
+      "required": ["algorithm", "fingerprint", "public_key"],
+      "properties": {
+        "algorithm": {"const": "ed25519"},
+        "fingerprint": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "public_key": {"type": "string", "minLength": 43, "maxLength": 64}
+      },
+      "additionalProperties": false
+    },
+    "receipt_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "signature": {"type": "string", "minLength": 86, "maxLength": 128}
+  },
+  "additionalProperties": false
+}

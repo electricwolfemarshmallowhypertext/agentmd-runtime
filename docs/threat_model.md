@@ -5,6 +5,7 @@
 - repository instructions, skills, memory, policies, and evals
 - Lead Artifact inputs and compiled current-state packets
 - execution and skill-edit receipts
+- signed agent identity records and export envelopes
 - Git and CI provenance
 - credentials present in developer or CI environments
 
@@ -26,8 +27,16 @@ selected workspace. Skill mutations are further restricted to
 ### Receipt boundary
 
 Lead receipts bind source artifact hashes and chain to the previous valid
-receipt. Modified receipts are excluded from trust history. These controls are
-tamper-evident, not tamper-proof: receipts are not asymmetrically signed.
+receipt. Modified receipts are excluded from trust history. Existing Lead,
+context, and skill receipts are hash-based and are not asymmetrically signed.
+
+### Identity boundary
+
+Identity records and export envelopes are Ed25519-signed and hash-chained.
+AgentMD stores the public key but never stores or generates the private key.
+Cross-machine import requires an explicitly trusted public-key fingerprint.
+Self-consistent verification proves internal chain integrity; fingerprint-pinned
+verification additionally proves continuity with the key the operator trusts.
 
 ### CI boundary
 
@@ -48,6 +57,9 @@ timeouts, vulnerability auditing, and repository indicator scanning.
 | Trust-score replay | source hash and run ID observations are deduplicated |
 | Receipt-history modification | receipt hash verification and previous-hash chaining |
 | Self-asserted skill score | accepted edits require a bound validation receipt |
+| Identity record tampering | Ed25519 signatures, state hashes, and receipt-hash chaining |
+| Identity substitution during import | required operator-pinned signer fingerprint |
+| Identity history rewind | append-only versions and import prefix validation |
 | CI dependency substitution | exact Action SHAs and hash-locked Python packages |
 | Executable model/data formats | unsupported; AgentMD accepts JSON/JSONL artifacts only |
 
@@ -84,10 +96,12 @@ Primary sources:
 ## Explicit non-guarantees
 
 - No cryptographic source identity for AI/tool artifacts yet.
-- No asymmetric receipt or evaluator signatures yet.
+- Lead, context, and skill receipts are not asymmetrically signed.
+- Identity signatures prove control of the trusted private key, not that a
+  human personally authored or approved the identity content.
 - No sandboxed adapter execution because adapters are not executed in v0.x.
 - No guarantee against a malicious actor who controls both the workspace and
-  the signing or CI identity planned for future releases.
+  the external identity signing key.
 - No production SaaS security claim.
 - No runtime egress sandbox; AgentMD v0.x does not execute adapters, and CI
   network policy remains a repository/runner control.

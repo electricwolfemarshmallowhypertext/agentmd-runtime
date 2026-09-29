@@ -8,6 +8,8 @@ This document describes receipt integrity properties in AgentMD today.
 - Lead compile receipts: `.sticky/receipts/*.jsonl`
 - Skill gate receipts: `.sticky/skill-receipts/*.jsonl`
 - Rejected skill edit records: `.sticky/rejected-skill-edits/*.jsonl`
+- Identity version records: `.agentmd/identity/records/*.json` (signed and
+  hash-chained)
 
 ## What receipt hashes cover
 
@@ -46,13 +48,18 @@ Limitations:
 - no external notarization
 - no transparency log
 - no hardware-backed attestation
-- no signature chain across environments
-- anyone with write access can still replace a receipt chain and recompute unsigned hashes
+- existing Lead, context, and skill receipts have no signature chain across environments
+- anyone with write access can replace an unsigned receipt chain and recompute its hashes
 
-## What is not yet cryptographically signed
+## Cryptographic signing boundary
 
-- receipts are not signed with asymmetric keys
+- Identity version records and identity export envelopes are signed with
+  Ed25519. Their public-key fingerprint can be pinned during verification and
+  is required during import.
+- AgentMD never stores the corresponding private key.
+- Lead, context, and skill receipts are not signed with asymmetric keys.
 - releases are not tied to receipt signatures
 - receipt provenance is not anchored to an external immutable ledger
 
-For stable release hardening, signed receipts and external attestation can be added as later phases.
+Identity signing does not retroactively authenticate AI/tool artifact sources,
+Lead receipts, skill evaluators, or releases.
