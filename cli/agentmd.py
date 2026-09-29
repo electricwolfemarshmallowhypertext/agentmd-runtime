@@ -72,8 +72,12 @@ LEAD_MAX_JSONL_RECORDS = 1_000
 LEAD_MAX_JSON_DEPTH = 32
 LEAD_SECRET_PATTERNS = {
     "openai_key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "anthropic_key": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
     "github_token": re.compile(r"\bgh[opsu]_[A-Za-z0-9]{30,}\b"),
+    "github_fine_grained_token": re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     "huggingface_token": re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    "google_api_key": re.compile(r"\bAIza[A-Za-z0-9_-]{30,}\b"),
+    "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     "aws_access_key": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 }
@@ -85,6 +89,13 @@ def _utc_now_iso() -> str:
 
 def _load_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _strict_json_loads(text: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    return json.loads(text, parse_constant=reject_constant)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -142,13 +153,16 @@ def _resolved_pointer_path(root: Path) -> Path:
 
 
 def _write_resolved_pointer(root: Path, resolved_path: Path) -> None:
-    ptr = _resolved_pointer_path(root)
+    ptr = _require_path_within(_resolved_pointer_path(root), root, "resolved_pointer_outside_workspace")
     ptr.parent.mkdir(parents=True, exist_ok=True)
-    ptr.write_text(str(resolved_path.resolve()), encoding="utf-8")
+    _atomic_write_text(ptr, str(resolved_path.resolve()))
 
 
 def _read_resolved_pointer(root: Path) -> Path | None:
-    ptr = _resolved_pointer_path(root)
+    try:
+        ptr = _require_path_within(_resolved_pointer_path(root), root, "resolved_pointer_outside_workspace")
+    except ValueError:
+        return None
     if not ptr.exists():
         return None
     raw = ptr.read_text(encoding="utf-8", errors="replace").strip()
@@ -157,7 +171,10 @@ def _read_resolved_pointer(root: Path) -> Path | None:
     p = Path(raw)
     if not p.is_absolute():
         p = (root / p).resolve()
-    return p
+    try:
+        return _require_path_within(p, root, "resolved_pointer_outside_workspace")
+    except ValueError:
+        return None
 
 
 def _display_path(root: Path, path: Path) -> str:
@@ -598,14 +615,18 @@ def _load_resolved(root: Path) -> tuple[dict[str, Any] | None, Path | None]:
     candidates.append(root / ".agentmd" / "resolved-context.json")
     seen: set[str] = set()
     for path in candidates:
-        key = str(path.resolve())
+        try:
+            path = _require_path_within(path, root, "resolved_context_outside_workspace")
+        except ValueError:
+            continue
+        key = str(path)
         if key in seen:
             continue
         seen.add(key)
         if not path.exists():
             continue
         try:
-            return json.loads(_load_text(path)), path.resolve()
+            return _strict_json_loads(_load_text(path)), path.resolve()
         except Exception:
             continue
     return None, None
@@ -624,12 +645,17 @@ def write_receipt(
 
     selected_context: list[dict[str, Any]] = []
     detected_changes: list[str] = []
+    receipt_warnings: list[str] = []
     if resolved:
         for item in resolved.get("selected", []):
             rel_path = item.get("path")
             if not rel_path:
                 continue
-            abs_path = root / rel_path
+            try:
+                abs_path = _require_path_within(root / str(rel_path), root, "receipt_context_path_outside_workspace")
+            except ValueError:
+                receipt_warnings.append(f"receipt_context_path_outside_workspace: {rel_path}")
+                continue
             current_hash = _sha256_file(abs_path) if abs_path.exists() and abs_path.is_file() else None
             selected_context.append({"path": rel_path, "sha256": current_hash})
             if item.get("sha256") and current_hash and item.get("sha256") != current_hash:
@@ -658,15 +684,19 @@ def write_receipt(
         "git_reason": git.get("reason"),
         "changed_files": changed_files,
         "untracked_files": untracked_files,
-        "validation": {"ok": validation["ok"], "errors": validation["errors"], "warnings": validation["warnings"]},
+        "validation": {
+            "ok": validation["ok"],
+            "errors": validation["errors"],
+            "warnings": [*validation["warnings"], *receipt_warnings],
+        },
     }
     receipt_material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(receipt_material).hexdigest()
 
-    receipts_dir = root / "receipts"
+    receipts_dir = _require_path_within(root / "receipts", root, "receipt_output_outside_workspace")
     receipts_dir.mkdir(parents=True, exist_ok=True)
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
-    out_path = receipts_dir / filename
+    out_path = _require_path_within(receipts_dir / filename, root, "receipt_output_outside_workspace")
     _atomic_write_text(out_path, json.dumps(receipt) + "\n")
     return out_path, receipt
 
@@ -722,7 +752,7 @@ def _load_skill_edit_payload(root: Path, edit_path: Path) -> dict[str, Any]:
     if not path.exists() or not path.is_file():
         raise ValueError(f"skill_edit_missing: {_display_path(root, path)}")
     try:
-        parsed = json.loads(_load_text(path))
+        parsed = _strict_json_loads(_load_text(path))
     except Exception as e:
         raise ValueError(f"skill_edit_invalid_json: {_display_path(root, path)} ({e})") from e
     if not isinstance(parsed, dict):
@@ -751,10 +781,14 @@ def _apply_bounded_skill_edit(text: str, edit_type: str, target: str, replacemen
 
 
 def _write_skill_gate_record(root: Path, relative_dir: str, record: dict[str, Any]) -> Path:
-    out_dir = root / ".sticky" / relative_dir
+    out_dir = _require_path_within(
+        root / ".sticky" / relative_dir,
+        root,
+        "skill_record_output_outside_workspace",
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    out_path = out_dir / f"{timestamp}.jsonl"
+    out_path = _require_path_within(out_dir / f"{timestamp}.jsonl", root, "skill_record_output_outside_workspace")
     _atomic_write_text(out_path, json.dumps(record) + "\n")
     return out_path
 
@@ -775,7 +809,7 @@ def _load_skill_validation_receipt(
     if receipt_file.suffix.lower() != ".json" or not receipt_file.is_file():
         raise ValueError(f"skill_validation_receipt_missing: {_display_path(root, receipt_file)}")
     try:
-        receipt = json.loads(receipt_file.read_text(encoding="utf-8", errors="strict"))
+        receipt = _strict_json_loads(receipt_file.read_text(encoding="utf-8", errors="strict"))
     except Exception as e:
         raise ValueError(f"skill_validation_receipt_invalid_json: {_display_path(root, receipt_file)} ({e})") from e
     if not isinstance(receipt, dict):
@@ -830,7 +864,11 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     replacement_raw = edit_payload.get("replacement")
     replacement = "" if replacement_raw is None else str(replacement_raw)
 
-    temp_parent = root / ".tmp" / "skill-edit-temp"
+    temp_parent = _require_path_within(
+        root / ".tmp" / "skill-edit-temp",
+        root,
+        "skill_edit_temp_outside_workspace",
+    )
     temp_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="agentmd-skill-edit-", dir=temp_parent) as tmp_dir:
         tmp_path = Path(tmp_dir) / skill_file.name
@@ -1011,7 +1049,7 @@ def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[d
             if not line.strip():
                 continue
             try:
-                data = json.loads(line)
+                data = _strict_json_loads(line)
                 _lead_check_json_depth(data, f"{source}:{idx}")
             except Exception as e:
                 warnings.append(f"artifact_jsonl_invalid: {source}:{idx} ({e})")
@@ -1024,7 +1062,7 @@ def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[d
 
     if suffix == ".json":
         try:
-            parsed = json.loads(text)
+            parsed = _strict_json_loads(text)
             _lead_check_json_depth(parsed, source)
         except Exception as e:
             warnings.append(f"artifact_json_invalid: {source} ({e})")
@@ -1610,14 +1648,16 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     md.append("")
 
     md.append("## Proof")
-    md.append(f"- run_id: {proof.get('run_id')}")
-    md.append(f"- timestamp: {proof.get('timestamp')}")
-    md.append(f"- context_bundle_hash: {proof.get('context_bundle_hash')}")
-    md.append(f"- receipt_hash: {proof.get('receipt_hash')}")
-    md.append(f"- git_commit: {git_state.get('commit')}")
-    md.append(f"- git_dirty: {git_state.get('dirty')}")
-    md.append(f"- changed_files: {', '.join(git_state.get('changed_files', [])) or 'none'}")
-    md.append(f"- untracked_files: {', '.join(git_state.get('untracked_files', [])) or 'none'}")
+    md.append(f"- run_id: {_markdown_untrusted(proof.get('run_id'))}")
+    md.append(f"- timestamp: {_markdown_untrusted(proof.get('timestamp'))}")
+    md.append(f"- context_bundle_hash: {_markdown_untrusted(proof.get('context_bundle_hash'))}")
+    md.append(f"- receipt_hash: {_markdown_untrusted(proof.get('receipt_hash'))}")
+    md.append(f"- git_commit: {_markdown_untrusted(git_state.get('commit'))}")
+    md.append(f"- git_dirty: {_markdown_untrusted(git_state.get('dirty'))}")
+    changed_files = ", ".join(_markdown_untrusted(item) for item in git_state.get("changed_files", [])) or "none"
+    untracked_files = ", ".join(_markdown_untrusted(item) for item in git_state.get("untracked_files", [])) or "none"
+    md.append(f"- changed_files: {changed_files}")
+    md.append(f"- untracked_files: {untracked_files}")
     md.append("")
 
     md.append("## Validation")
@@ -1685,12 +1725,24 @@ def _receipt_hash_matches(receipt: dict[str, Any]) -> bool:
 
 
 def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    receipts_dir = root / ".sticky" / "receipts"
+    receipts_dir = _require_path_within(
+        root / ".sticky" / "receipts",
+        root,
+        "lead_receipt_output_outside_workspace",
+    )
     if not receipts_dir.exists():
         return None, []
 
     warnings: list[str] = []
     for path in reversed(sorted(receipts_dir.glob("*.jsonl"))):
+        try:
+            path = _require_path_within(path, root, "receipt_history_outside_workspace")
+        except ValueError:
+            warnings.append(f"receipt_history_outside_workspace: {_display_path(root, path)}")
+            continue
+        if path.stat().st_size > LEAD_MAX_ARTIFACT_BYTES:
+            warnings.append(f"receipt_history_too_large: {_display_path(root, path)}")
+            continue
         try:
             lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         except OSError:
@@ -1698,8 +1750,8 @@ def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[
             continue
         for line in reversed(lines):
             try:
-                receipt = json.loads(line)
-            except json.JSONDecodeError:
+                receipt = _strict_json_loads(line)
+            except (json.JSONDecodeError, ValueError):
                 warnings.append(f"receipt_history_invalid_json: {_display_path(root, path)}")
                 continue
             if not isinstance(receipt, dict) or not _receipt_hash_matches(receipt):
@@ -1869,7 +1921,7 @@ def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) ->
     receipts_dir = root / ".sticky" / "receipts"
     receipts_dir.mkdir(parents=True, exist_ok=True)
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
-    out_path = receipts_dir / filename
+    out_path = _require_path_within(receipts_dir / filename, root, "lead_receipt_output_outside_workspace")
     _atomic_write_text(out_path, json.dumps(receipt) + "\n")
     return out_path, receipt
 
@@ -1928,10 +1980,10 @@ def compile_lead_state(
                 merged = sorted({*current_warnings, *warnings})
                 validation["warnings"] = merged
 
-    sticky_dir = root / ".sticky"
+    sticky_dir = _require_path_within(root / ".sticky", root, "lead_output_outside_workspace")
     sticky_dir.mkdir(parents=True, exist_ok=True)
-    json_path = sticky_dir / "current-state.json"
-    md_path = sticky_dir / "current-state.md"
+    json_path = _require_path_within(sticky_dir / "current-state.json", root, "lead_output_outside_workspace")
+    md_path = _require_path_within(sticky_dir / "current-state.md", root, "lead_output_outside_workspace")
     _atomic_write_text(json_path, json.dumps(packet, indent=2))
     _atomic_write_text(md_path, _lead_current_state_markdown(packet))
 

@@ -60,10 +60,14 @@
       "minLength": 1
     },
     "baseline_score": {
-      "type": "number"
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
     },
     "validation_score": {
-      "type": "number"
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
     },
     "validation_task": {
       "type": "string",

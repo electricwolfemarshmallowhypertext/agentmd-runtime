@@ -1210,3 +1210,107 @@ def test_lead_compile_rejects_excessive_json_depth(ws: Path) -> None:
     assert result.exit_code == 1
     assert "artifact_json_too_deep" in result.stdout
     assert not (ws / ".sticky" / "current-state.json").exists()
+
+
+def test_receipt_ignores_resolved_pointer_outside_workspace(ws: Path) -> None:
+    scaffold_workspace(ws)
+    outside = ws.parent / f"{ws.name}-outside-resolved.json"
+    outside.write_text(json.dumps({"task": "outside", "selected": []}), encoding="utf-8")
+    pointer = ws / ".agentmd" / "last-resolved-path.txt"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(str(outside), encoding="utf-8")
+    try:
+        result = runner.invoke(app, ["receipt", "--root", str(ws)])
+    finally:
+        outside.unlink(missing_ok=True)
+
+    assert result.exit_code == 0
+    receipt_path = sorted((ws / "receipts").glob("*.jsonl"))[-1]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["task"] is None
+    assert receipt["resolved_context_file"] is None
+
+
+def test_receipt_does_not_hash_context_outside_workspace(ws: Path) -> None:
+    scaffold_workspace(ws)
+    outside = ws.parent / f"{ws.name}-outside-context.md"
+    outside.write_text("sensitive outside content", encoding="utf-8")
+    resolved = {
+        "task": "tampered context",
+        "selected": [{"path": f"../{outside.name}", "sha256": "0" * 64}],
+    }
+    resolved_path = ws / ".agentmd" / "resolved-context.json"
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path.write_text(json.dumps(resolved), encoding="utf-8")
+    try:
+        result = runner.invoke(app, ["receipt", "--root", str(ws)])
+    finally:
+        outside.unlink(missing_ok=True)
+
+    assert result.exit_code == 0
+    receipt_path = sorted((ws / "receipts").glob("*.jsonl"))[-1]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["selected_context_files"] == []
+    assert receipt["file_hashes"] == {}
+    assert any(
+        item.startswith("receipt_context_path_outside_workspace:")
+        for item in receipt["validation"]["warnings"]
+    )
+
+
+def test_lead_compile_rejects_non_standard_json_numbers(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact_path = ws / "non-standard.json"
+    payload = json.dumps(valid_lead_artifact()).replace('"claims": []', '"claims": [NaN]')
+    artifact_path.write_text(payload, encoding="utf-8")
+
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+
+    assert result.exit_code == 1
+    assert "non-standard JSON constant" in result.stdout
+    assert not (ws / ".sticky" / "current-state.json").exists()
+
+
+def test_lead_compile_sanitizes_untrusted_proof_markdown(ws: Path) -> None:
+    scaffold_workspace(ws)
+    artifact = valid_lead_artifact(
+        git_state={
+            "available": True,
+            "commit": "<img src=https://attacker.invalid/commit>",
+            "dirty": True,
+            "changed_files": ["![leak](https://attacker.invalid/changed)"],
+            "untracked_files": ["<script>alert(1)</script>"],
+            "reason": None,
+        }
+    )
+    artifact_path = ws / "proof-markdown.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+
+    assert result.exit_code == 0
+    markdown = (ws / ".sticky" / "current-state.md").read_text(encoding="utf-8")
+    assert "<img" not in markdown
+    assert "<script>" not in markdown
+    assert "![leak]" not in markdown
+    assert "&lt;img" in markdown
+
+
+def test_lead_compile_rejects_additional_provider_secrets(ws: Path) -> None:
+    scaffold_workspace(ws)
+    secrets = [
+        "github_pat_" + "A" * 40,
+        "sk-ant-" + "a" * 32,
+        "AIza" + "A" * 35,
+        "xoxb-" + "1234567890-ABCDEFGHIJ",
+    ]
+    for index, secret in enumerate(secrets):
+        artifact_path = ws / f"provider-secret-{index}.json"
+        artifact_path.write_text(
+            json.dumps(valid_lead_artifact(run_id=f"secret-{index}", claims=[{"claim": secret, "verification_status": "unverified"}])),
+            encoding="utf-8",
+        )
+        result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", str(artifact_path)])
+        assert result.exit_code == 1
+        assert "lead_artifact_secret_detected" in result.stdout
+        assert secret not in result.stdout
