@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 __pycache__/
 .pytest_cache/
 .tmp/
@@ -21,3 +21,6 @@ data/
 !examples/lead-artifacts/**
 !examples/lead-output/
 !examples/lead-output/**
+
+# Local audit planning
+TODO.local.md
