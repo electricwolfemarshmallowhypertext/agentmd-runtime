@@ -27,7 +27,7 @@ Real verification logs and report are in `.agentmd/verification/`; execution rec
 
 ## What is not established
 
-- The legacy API is not fully installed/booted/validated; its remaining dependency audit findings remain a release blocker. See `docs/security_hardening_todo.md`.
+- The isolated embedding/storage path and Google/telemetry slices have real local validation, but the full legacy API is not installed/booted/validated as one deployed service. See `embedding_validation.md` and `security_hardening_todo.md`.
 - Example provider artifacts do not establish live provider calls. The local runner is not a tool-specific integration or sandbox.
 - A source's `verified` claim is still asserted, not authenticated. Receipts establish bytes and local process outcomes, not semantic truth.
 - Skill validation receipts bind externally supplied scores and hashes. They do not execute or authenticate an evaluator or prove improvement.

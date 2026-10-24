@@ -19,8 +19,8 @@ Acceptance is correct results on real local work, rejection without inconsistent
 
 ## Remaining blockers and non-goals
 
-- Legacy API dependencies are not a supported production runtime: sentence-transformers requires a separately validated migration; the coupled OpenTelemetry/Firestore update passed offline dependency/client/serialization checks. Its direct audit gate remains failing, not bypassed.
-- No real model-provider calls, provider credentials, hosted auth/account actions or cloud deployments were run.
+- Sentence Transformers 6.0.0 and the isolated memory engine passed actual offline model/storage validation, including persistence/fallback/backup and model contract checks; the coupled OpenTelemetry/Firestore update passed offline dependency/client/serialization checks. These are scoped runtime checks, not full production API assurance.
+- Real local MiniLM CPU inference was run using an approved pinned safetensors snapshot. No paid model-provider calls, provider credentials, hosted auth/account actions or cloud deployments were run.
 - Skill edits verify supplied score/receipt/hash consistency, not the evaluator's truth or actual improvement; no optimizer/benchmark engine is implemented.
 - Imported claims remain source assertions; hashes are not authentication or truth verification.
 - No signature chain, external notarization, production-SaaS assurance or multi-user execution isolation.

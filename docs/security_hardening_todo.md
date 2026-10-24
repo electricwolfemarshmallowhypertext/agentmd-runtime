@@ -25,19 +25,19 @@ This does **not** establish historical credential safety or account cleanup:
 - Empty discovery remains zero evidence, compiler receipts do not feed themselves back, and prepared receipts are not successful execution evidence.
 - Local `run` now executes explicit argv and records actual failures/timeouts; it is not a sandbox/provider integration.
 
-## Dependency gate — not yet green
+## Current dependency and model validation
 
 The October advisory refresh found new issues despite September's successful audits.
 
 - CLI/CI lock: certifi updated to `2026.10.19`, filelock to `4.2.1`; hash-lock installation and current audit must pass on the final branch. Colorama is retained explicitly for Windows hash-locked installs.
 - Legacy API: unused `python-jose` removed (Firebase Admin handles token verification); aiohttp updated to `3.14.4`, Black to `26.10.1` with focused genuine local smoke checks.
-- **Blocked: sentence-transformers `2.2.2`.** The scanner suggests `5.6.0`, but upstream says trust enforcement for local custom modules begins in `6.0.0`. A blind major upgrade is not compatibility evidence. Existing API issues include the memory-engine exception import, legacy Chroma configuration, and 384-vs-1024 embedding dimensions. A real local-model/storage migration is needed; no model was downloaded or invoked for this repair.
+- **Sentence Transformers `6.0.0`:** upgraded after approved real offline MiniLM CPU inference and Chroma/SQLite persistence/query/transfer/backup checks, not just a scanner pin bump. Corrected the old exception import, obsolete Chroma API, dimensions, text/thread/persona storage, fallback retrieval and destructive cleanup. Stores now require an actual loaded-model fingerprint and finite float32 vectors; existing unknown/mismatched stores are rejected, not silently migrated. See `embedding_validation.md`.
 - **Coordinated OpenTelemetry/Firestore update:** API/SDK/OTLP exporter `1.45.1`, instrumentation `0.66b1`, Firestore `2.34.1`, protobuf `6.33.6`. The old Firestore `<5` protobuf conflict was resolved by a tested compatible Firestore update. Real offline client/protobuf roundtrips and instrumented HTTP/in-memory span export passed with existing Firebase Admin/AI Platform pins; this is not a live Firestore service or full API boot test.
-- The API direct audit remains intentionally failing while those pins remain; the CI gate has not been removed/ignored. Direct auditing does not cover full transitive installation or production reachability.
+- Audit gates remain enabled with no ignored findings. Direct auditing does not cover full transitive installation or production reachability; separate resolved slices/model runtime were also audited. Full legacy API boot and live cloud/auth integration remain unverified.
 
 ## Required before release
 
-- [ ] Resolve remaining legacy API dependency gates, or obtain an explicit product/support-scope decision; do not silently suppress the gate.
+- [ ] Revalidate dependency gates and the supported legacy API/service scope on the release candidate; do not equate isolated model/client checks with full production integration.
 - [ ] Re-run fresh hash-locked install, CLI outcomes, real local verification artifact, compiler repeat/integrity checks and all dependency audits on the final candidate.
 - [ ] Run new behavior and wrappers natively on Windows/Python 3.11; Linux verification is not a Windows claim.
 - [ ] Review local diff, unsigned-receipt limitations and all account-level unknowns.

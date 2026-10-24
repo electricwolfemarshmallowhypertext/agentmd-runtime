@@ -67,4 +67,4 @@ Upload generated outputs as workflow artifacts:
 - Keep `if-no-files-found: error` in artifact upload so silent output loss fails fast.
 - On failure, capture step logs and uploaded artifacts from the last successful run for comparison.
 
-The legacy API audit has unresolved migration blockers; see `security_hardening_todo.md`. A passing compiler run is not a production release gate or authenticated truth proof.
+The legacy API has only scoped local model/storage and client validation; see `embedding_validation.md` and `security_hardening_todo.md`. A passing compiler run is not a production release gate or authenticated truth proof.

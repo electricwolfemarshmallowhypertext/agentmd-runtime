@@ -19,7 +19,7 @@ Schema validation, deterministic hashes and receipts establish local integrityâ€
 - `run` now executes caller-specified argv locally; provider-specific integrations are not implemented or verified.
 - Example provider-named artifacts are fixtures, not evidence of calls to Codex, Claude or Gemini.
 - Source identity is asserted, not authenticated; `what_is_true` means source-reported verified claims, never an authorization score.
-- The legacy API dependency gate remains blocked; do not release on the basis of a passing CLI suite alone.
+- The isolated memory engine now has real offline MiniLM/Chroma/SQLite validation; see `docs/embedding_validation.md`. This does not establish full legacy API/production readiness.
 
 ## Trust & adoption docs
 
@@ -29,6 +29,7 @@ Schema validation, deterministic hashes and receipts establish local integrityâ€
 - `docs/determinism.md`
 - `docs/receipt_integrity.md`
 - `docs/threat_model.md`
+- `docs/embedding_validation.md`
 - `SECURITY.md`
 
 ## Problem

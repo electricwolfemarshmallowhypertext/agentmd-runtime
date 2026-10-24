@@ -8,10 +8,13 @@ starlette==1.7.0
 anthropic==0.49.0
 openai==1.30.0
 google-cloud-aiplatform==1.133.0
-sentence-transformers==2.2.2  # Dedicated embedding model
+sentence-transformers==6.0.0  # Enforces trust_remote_code=False for local custom modules
+torch==2.14.1  # CPU +cpu build tested; see docs/embedding_validation.md
+numpy==1.26.4  # Compatible with the retained Chroma 0.4 native stack
 
 # Vector Storage & Memory
 chromadb==0.4.15
+posthog==5.4.0  # Compatible Chroma telemetry API; telemetry disabled by engine
 duckdb==1.5.6
 clickhouse-connect==0.6.20
 SQLAlchemy==2.0.23  # For SQLite fallback
