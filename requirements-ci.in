@@ -1,3 +1,7 @@
 -r requirements-cli.txt
 pip-audit==2.10.1
 pytest==9.0.3
+# Keep the Windows pytest/Click dependency in cross-platform hash-locked installs.
+colorama==0.4.6
+# pip-api requires pip; pin it so clean cross-platform wheel resolution is hash-complete.
+pip==26.2.2

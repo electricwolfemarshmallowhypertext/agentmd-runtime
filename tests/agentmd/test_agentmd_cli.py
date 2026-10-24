@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -1314,3 +1315,362 @@ def test_lead_compile_rejects_additional_provider_secrets(ws: Path) -> None:
         assert result.exit_code == 1
         assert "lead_artifact_secret_detected" in result.stdout
         assert secret not in result.stdout
+
+
+def _canonical_hash(value: dict, field: str) -> str:
+    payload = {key: item for key, item in value.items() if key != field}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_lead_warning_packet_and_receipt_bind_final_bytes(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "receipts" / "bad.jsonl").write_text("NOT JSON\n")
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+    assert result.exit_code == 0, result.stdout
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    receipt = json.loads(next((ws / ".sticky/receipts").glob("*.jsonl")).read_text())
+    assert packet["validation"]["warnings"]
+    assert packet["deterministic_hash"] == _canonical_hash(packet, "deterministic_hash")
+    assert receipt["current_state_hash"] == packet["deterministic_hash"]
+    assert receipt["receipt_hash"] == _canonical_hash(receipt, "receipt_hash")
+
+
+@pytest.mark.parametrize("timestamp", ["not-a-date", "2026-02-30T00:00:00Z", "2026-10-24", "2026-10-24T00:00:00", "2026-10-24T00:00:00+01:60", "2026-10-24T24:00:00Z", "2026-10-24T10:00:00.١Z"])
+def test_lead_timestamp_validation_does_not_depend_on_optional_jsonschema_formats(ws: Path, timestamp: str) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact(timestamp=timestamp)))
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", "input.json"])
+    assert result.exit_code == 1
+    assert "schema_invalid" in result.stdout
+    assert not (ws / ".sticky/current-state.json").exists()
+
+
+@pytest.mark.parametrize("earlier,later", [
+    ("2026-10-24T23:00:00+14:00", "2026-10-24T10:00:00Z"),
+    ("2026-10-24T10:00:00.0000001Z", "2026-10-24T10:00:00.0000002Z"),
+])
+def test_lead_uses_chronological_instants_for_task_proof_and_loop_state(ws: Path, earlier: str, later: str) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps([
+        valid_lead_artifact("z-earlier", timestamp=earlier, task="OLDER", open_loops=[{"text": "same loop", "status": "open"}]),
+        valid_lead_artifact("a-later", timestamp=later, task="NEWER", open_loops=[{"text": "same loop", "status": "closed"}]),
+    ]))
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", "input.json"])
+    assert result.exit_code == 0, result.stdout
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert packet["task"] == "NEWER"
+    assert packet["proof"]["run_id"] == "a-later"
+    assert packet["current_state"]["open_loops"] == [{"text": "same loop", "status": "closed"}]
+    assert "Close open loop" not in packet["current_state"]["next_clean_action"]
+
+
+def test_lead_invalid_workspace_preserves_all_prior_outputs(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact()))
+    args = ["lead", "compile", "--root", str(ws), "--artifact", "input.json"]
+    assert runner.invoke(app, args).exit_code == 0
+    before = {p: p.read_bytes() for p in (ws / ".sticky").rglob("*") if p.is_file()}
+    (ws / "AGENTS.md").unlink()
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    assert "lead_workspace_validation_failed" in result.stdout
+    assert before == {p: p.read_bytes() for p in (ws / ".sticky").rglob("*") if p.is_file()}
+
+
+def test_lead_preflights_receipt_directory_before_replacing_packet(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact()))
+    args = ["lead", "compile", "--root", str(ws), "--artifact", "input.json"]
+    assert runner.invoke(app, args).exit_code == 0
+    before = [(ws / ".sticky" / name).read_bytes() for name in ["current-state.json", "current-state.md"]]
+    # Ordinary in-workspace invalid destination; no blocked skill-root probe.
+    shutil.rmtree(ws / ".sticky/receipts")
+    (ws / ".sticky/receipts").write_text("not a directory")
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact(task="changed")))
+    assert runner.invoke(app, args).exit_code == 1
+    assert before == [(ws / ".sticky" / name).read_bytes() for name in ["current-state.json", "current-state.md"]]
+
+
+def test_lead_rolls_back_packet_if_receipt_commit_fails(ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact()))
+    args = ["lead", "compile", "--root", str(ws), "--artifact", "input.json"]
+    assert runner.invoke(app, args).exit_code == 0
+    before = {p: p.read_bytes() for p in (ws / ".sticky").rglob("*") if p.is_file()}
+    real_replace = Path.replace
+    def fail_receipt_commit(path: Path, target: Path) -> Path:
+        if Path(target).parent.name == "receipts":
+            raise OSError("synthetic disk failure")
+        return real_replace(path, target)
+    monkeypatch.setattr(Path, "replace", fail_receipt_commit)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact(task="changed")))
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    assert "prior output files preserved" in result.stdout
+    assert before == {p: p.read_bytes() for p in (ws / ".sticky").rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_lead_synthetic_secret_keys_never_reach_diagnostics(ws: Path, nested: bool) -> None:
+    scaffold_workspace(ws)
+    sentinel = "sk-" + "A" * 30  # Intentionally fake, nonworking security sentinel.
+    data = valid_lead_artifact()
+    if nested:
+        data["claims"] = [{"claim": "ordinary", sentinel: "ordinary"}]
+    else:
+        data[sentinel] = "ordinary"
+    (ws / "input.json").write_text(json.dumps(data))
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", "input.json"])
+    assert result.exit_code == 1
+    assert "lead_artifact_secret_detected" in result.stdout
+    assert sentinel not in result.stdout
+    assert not (ws / ".sticky").exists()
+
+
+@pytest.mark.parametrize("status", ["closed", "completed", "done", "resolved", "cancelled", "canceled", "CLOSED"])
+def test_lead_terminal_loops_not_recommended(ws: Path, status: str) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact(open_loops=[{"text": "finished", "status": status}, {"text": "work remains", "status": "open"}])))
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--artifact", "input.json"])
+    assert result.exit_code == 0, result.stdout
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert packet["current_state"]["next_clean_action"] == "Close open loop: work remains"
+
+
+def test_lead_no_input_is_honest_zero_evidence(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+    assert result.exit_code == 0, result.stdout
+    # Repeated compiles must not ingest their own receipts as phantom runs.
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+    assert result.exit_code == 0
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert packet["artifacts_ingested"] == 0
+    assert packet["artifacts"] == []
+    assert packet["artifact_sources"] == []
+    assert packet["proof"]["run_id"] is None
+    assert packet["proof"]["timestamp"] is None
+    assert packet["evidence_status"] == "no_evidence"
+    assert "Collect a tool-run artifact" in packet["current_state"]["next_clean_action"]
+
+
+def test_lead_missing_chain_predecessor_is_not_consumed(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "input.json").write_text(json.dumps(valid_lead_artifact()))
+    args = ["lead", "compile", "--root", str(ws), "--artifact", "input.json"]
+    assert runner.invoke(app, args).exit_code == 0
+    assert runner.invoke(app, args).exit_code == 0
+    first, second = sorted((ws / ".sticky/receipts").glob("*.jsonl"))
+    first.unlink()
+    assert runner.invoke(app, args).exit_code == 0
+    receipt = json.loads(sorted((ws / ".sticky/receipts").glob("*.jsonl"))[-1].read_text())
+    assert receipt["previous_receipt_hash"] is None
+    assert any("receipt_history_chain_mismatch" in warning for warning in receipt["validation_warnings"])
+    assert receipt["trust"]["current_observations"]  # Orphaned history must not suppress a real observation.
+
+
+def _run_receipts(ws: Path) -> list[dict]:
+    return [json.loads(path.read_text()) for path in sorted((ws / "receipts").glob("*.jsonl"))]
+
+
+def test_run_executes_real_context_hash_verification_without_shell(ws: Path) -> None:
+    scaffold_workspace(ws)
+    program = ws / "verify_context.py"
+    program.write_text("""import hashlib, json, os
+from pathlib import Path
+manifest = json.loads(Path(os.environ['AGENTMD_CONTEXT_FILE']).read_text())
+for entry in manifest['selected']:
+    assert hashlib.sha256(Path(entry['path']).read_bytes()).hexdigest() == entry['sha256']
+Path('verified.json').write_text(json.dumps({'selected': len(manifest['selected']), 'task': os.environ['AGENTMD_TASK']}))
+print('context hashes verified')
+""")
+    task = "verify context; do not interpret $(anything)"
+    args = ["run", "--root", str(ws), "--task", task, "--", sys.executable, str(program)]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.stdout
+    verified = json.loads((ws / "verified.json").read_text())
+    assert verified["selected"] > 0
+    assert verified["task"] == task
+    pre, post = _run_receipts(ws)
+    assert pre["execution"]["status"] == "prepared"
+    assert post["execution"]["status"] == "completed"
+    assert post["execution"]["pre_receipt_hash"] == pre["receipt_hash"]
+    assert post["execution"]["output"]["stdout"]["sha256"] == hashlib.sha256(("context hashes verified" + os.linesep).encode()).hexdigest()
+    assert post["execution"]["context_manifest_sha256"] == hashlib.sha256((ws / ".agentmd/resolved-context.json").read_bytes()).hexdigest()
+    assert post["receipt_hash"] == _canonical_hash(post, "receipt_hash")
+    assert "verify_context.py" not in json.dumps(post)  # Actual argv is not logged.
+
+
+@pytest.mark.parametrize("kind,expected_code,expected_status", [
+    ("failed", 7, "failed"), ("launch", 127, "launch_failed"),
+    ("timeout", 124, "timed_out"), ("output", 125, "output_limit_exceeded"),
+])
+def test_run_real_process_terminal_outcomes(ws: Path, kind: str, expected_code: int, expected_status: str) -> None:
+    scaffold_workspace(ws)
+    programs = {
+        "failed": [sys.executable, "-c", "raise SystemExit(7)"],
+        "launch": [str(ws / "nonexistent-executable")],
+        "timeout": [sys.executable, "-c", "import time; time.sleep(20)"],
+        "output": [sys.executable, "-c", "import sys; sys.stdout.write('X' * 200000)"],
+    }
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "real process outcome", "--timeout", "0.2", "--output-limit", "1024", "--", *programs[kind]])
+    assert result.exit_code == expected_code, result.stdout
+    pre, post = _run_receipts(ws)
+    assert post["execution"]["status"] == expected_status
+    assert post["execution"]["launched"] is (kind != "launch")
+    assert post["receipt_hash"] == _canonical_hash(post, "receipt_hash")
+    if kind == "output":
+        assert post["execution"]["output"]["stdout"]["hashed_bytes"] == 1024
+        assert post["execution"]["output"]["stdout"]["complete"] is False
+
+
+def test_run_invalid_workspace_never_launches_child(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "AGENTS.md").unlink()
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "must not launch", "--", sys.executable, "-c", "from pathlib import Path; Path('launched').touch()"])
+    assert result.exit_code == 1
+    assert not (ws / "launched").exists()
+    assert _run_receipts(ws) == []
+
+
+def test_run_requires_explicit_command_not_guessed_adapter(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "no guesses", "--adapter", "codex"])
+    assert result.exit_code == 2
+    assert _run_receipts(ws) == []
+
+
+def test_run_does_not_echo_or_record_synthetic_output_or_argv(ws: Path) -> None:
+    scaffold_workspace(ws)
+    sentinel = "sk-" + "A" * 30  # Fake security sentinel, never a live credential.
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "privacy", "--", sys.executable, "-c", "import sys; print(sys.argv[1])", sentinel])
+    assert result.exit_code == 0, result.stdout
+    assert sentinel not in result.stdout
+    assert all(sentinel not in json.dumps(receipt) for receipt in _run_receipts(ws))
+    output = _run_receipts(ws)[-1]["execution"]["output"]["stdout"]
+    assert output["sha256"] == hashlib.sha256((sentinel + os.linesep).encode()).hexdigest()
+
+
+def test_run_failure_stays_failed_when_compiled_into_lead_state(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "actual failed work", "--", sys.executable, "-c", "raise SystemExit(7)"])
+    assert result.exit_code == 7
+    assert runner.invoke(app, ["lead", "compile", "--root", str(ws)]).exit_code == 0
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert packet["artifacts_ingested"] == 1  # Terminal receipt only, not prepared or compiler receipts.
+    assert packet["artifacts"][0]["verification_status"] == "contradicted"
+    assert packet["artifacts"][0]["execution"]["returncode"] == 7
+    assert "Investigate local execution outcome: failed" in packet["current_state"]["next_clean_action"]
+    assert runner.invoke(app, ["lead", "compile", "--root", str(ws)]).exit_code == 0
+    again = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert again["artifacts_ingested"] == 1
+    assert again["deterministic_hash"] == packet["deterministic_hash"]
+
+
+def test_run_output_limit_detected_before_silent_child_timeout(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "bounded real output", "--timeout", "3", "--output-limit", "1024", "--", sys.executable, "-c", "import sys,time; sys.stdout.write('X'*1025); sys.stdout.flush(); time.sleep(20)"])
+    assert result.exit_code == 125
+    assert _run_receipts(ws)[-1]["execution"]["status"] == "output_limit_exceeded"
+
+
+def test_run_reports_post_execution_workspace_failure(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "local workspace change", "--", sys.executable, "-c", "from pathlib import Path; Path('AGENTS.md').unlink()"])
+    assert result.exit_code == 1
+    terminal = _run_receipts(ws)[-1]
+    assert terminal["execution"]["returncode"] == 0
+    assert terminal["execution"]["workspace_validation_ok"] is False
+    assert terminal["validation"]["ok"] is False
+
+
+def test_bundle_failed_rollback_preserves_recovery_bytes(ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from cli.agentmd import _atomic_write_bundle
+    old_path, second_path = ws / "old.txt", ws / "second.txt"
+    old_path.write_text("previous contents")
+    real_replace = Path.replace
+    def fail_commit_and_rollback(path: Path, target: Path) -> Path:
+        if target == second_path or path.suffix == ".bak":
+            raise OSError("synthetic unavailable destination")
+        return real_replace(path, target)
+    monkeypatch.setattr(Path, "replace", fail_commit_and_rollback)
+    with pytest.raises(ValueError, match="output_bundle_rollback_failed"):
+        _atomic_write_bundle(ws, [(old_path, "new contents"), (second_path, "second")])
+    backups = list(ws.glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "previous contents"
+
+
+def test_metadata_only_receipts_are_not_tool_run_evidence(ws: Path) -> None:
+    scaffold_workspace(ws)
+    assert runner.invoke(app, ["receipt", "--root", str(ws)]).exit_code == 0
+    assert runner.invoke(app, ["lead", "compile", "--root", str(ws)]).exit_code == 0
+    packet = json.loads((ws / ".sticky/current-state.json").read_text())
+    assert packet["artifacts_ingested"] == 0
+    assert packet["evidence_status"] == "no_evidence"
+    assert any("artifact_metadata_not_run_evidence" in warning for warning in packet["validation"]["warnings"])
+
+
+def test_lead_task_override_rejects_synthetic_secret_without_echo(ws: Path) -> None:
+    scaffold_workspace(ws)
+    sentinel = "sk-" + "A" * 30
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws), "--task", sentinel])
+    assert result.exit_code == 1
+    assert sentinel not in result.stdout
+    assert not (ws / ".sticky").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal lifecycle; Windows needs native interruption coverage")
+def test_run_interrupt_terminates_real_child_and_writes_terminal_receipt(ws: Path) -> None:
+    import signal
+    import subprocess
+    import time
+    scaffold_workspace(ws)
+    marker = ws / "child.pid"
+    command = [sys.executable, "-m", "cli.agentmd", "run", "--root", str(ws), "--task", "interrupt local work", "--timeout", "10", "--", sys.executable, "-c", "import os,time; from pathlib import Path; Path('child.pid').write_text(str(os.getpid())); time.sleep(30)"]
+    process = subprocess.Popen(command, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        child_pid = int(marker.read_text())
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 130, (stdout, stderr)
+        terminal = _run_receipts(ws)[-1]
+        assert terminal["execution"]["status"] == "interrupted"
+        assert terminal["execution"]["launched"] is True
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_declared_discovered_artifact_still_requires_complete_schema(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "receipts/incomplete.jsonl").write_text(json.dumps({"schema_version": "lead-artifact.v1"}) + "\n")
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+    assert result.exit_code == 1
+    assert "lead_artifact_schema_invalid" in result.stdout
+    assert not (ws / ".sticky").exists()
+
+
+def test_unhashed_execution_shaped_record_is_not_run_evidence(ws: Path) -> None:
+    scaffold_workspace(ws)
+    (ws / "receipts/incomplete.jsonl").write_text(json.dumps({"execution": {}}) + "\n")
+    result = runner.invoke(app, ["lead", "compile", "--root", str(ws)])
+    assert result.exit_code == 1
+    assert "lead_execution_receipt_invalid" in result.stdout
+    assert not (ws / ".sticky").exists()
+
+
+def test_run_nonfinite_timeout_rejected_before_any_launch(ws: Path) -> None:
+    scaffold_workspace(ws)
+    result = runner.invoke(app, ["run", "--root", str(ws), "--task", "bounded run", "--timeout", "nan", "--", sys.executable, "-c", "from pathlib import Path; Path('launched').touch()"])
+    assert result.exit_code == 2
+    assert not (ws / "launched").exists()
+    assert _run_receipts(ws) == []
+    assert not (ws / ".agentmd").exists()

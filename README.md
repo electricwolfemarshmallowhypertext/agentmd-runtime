@@ -1,28 +1,25 @@
-﻿# AgentMD Runtime
+# AgentMD Runtime
 
 [![CI](https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/actions/workflows/ci.yml)
 [![AgentMD Lead Demo](https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/actions/workflows/agentmd-lead-demo.yml/badge.svg?branch=main)](https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/actions/workflows/agentmd-lead-demo.yml)
 [![Latest Release](https://img.shields.io/github/v/release/electricwolfemarshmallowhypertext/agentmd-runtime?display_name=tag)](https://github.com/electricwolfemarshmallowhypertext/agentmd-runtime/releases)
 
-**AgentMD compiles scattered AI/tool runs into one verified current-state packet.**
+**AgentMD compiles AI/tool run evidence into a reproducible current-state packet.**
 
-It compiles scattered AI/tool runs into one verified current-state packet, with schema validation, deterministic hashes, and proof receipts.
+Schema validation, deterministic hashes and receipts establish local integrity—not the truth of imported claims or authenticated provider identity.
 
 ![AgentMD Flow](docs/assets/agentmd-flow.png)
 
 ## Proof
 
-- Current public release: `v0.3.0-alpha.2`
-- `v0.2.0`: AI Work Lead checkpoint
-- `v0.3.0-alpha.2`: CI-verified alpha with gated skill edit primitive
-- Published alpha CI status predates the September 2026 security audit
-- Local security-hardening branch tests: `36 passed`
-- Public `main` remediation and fresh CI proof are required before the next release
-- Deterministic demo script: `scripts/demo-lead-compile.ps1`
-- Lead Artifact schema validation is enforced (`schemas/lead-artifact.schema.json`)
-- Lead receipts include chained hashes, source artifact hashes, replay resistance, and advisory `trust-weight.v1` metadata
-- Source identity is asserted, not authenticated; AgentMD does not convert self-reported status into an authorization score
-- Technical proof note: `docs/proof_note.md`
+- Public release baseline: `v0.3.0-alpha.3`, commit `6602fc4874c1824faa4d2fd23d3ec560fd39db21` (September 29, 2026).
+- Its historical Windows CI and demo passed with 41 targeted CLI tests; that is not a current dependency-safety guarantee.
+- October fixes on this review branch are local/unreleased. See `docs/proof_note.md` for outcome-based verification and remaining blockers.
+- The compiler, file hashes, receipts and bounded skill edits are real local operations.
+- `run` now executes caller-specified argv locally; provider-specific integrations are not implemented or verified.
+- Example provider-named artifacts are fixtures, not evidence of calls to Codex, Claude or Gemini.
+- Source identity is asserted, not authenticated; `what_is_true` means source-reported verified claims, never an authorization score.
+- The legacy API dependency gate remains blocked; do not release on the basis of a passing CLI suite alone.
 
 ## Trust & adoption docs
 
@@ -51,7 +48,7 @@ task
 
 ## AI Work Lead
 
-`agentmd lead compile` turns scattered run artifacts into one verified operating picture with deterministic hashing and proof receipts.
+`agentmd lead compile` turns scattered run artifacts into one evidence-labelled operating picture with deterministic hashing and proof receipts.
 
 ![Verified Current-State Packet](docs/assets/current-state-packet.png)
 
@@ -76,7 +73,8 @@ Lead Artifact is the portable input contract for any tool (Codex, Claude, Gemini
 
 - Schema: `schemas/lead-artifact.schema.json`
 - Required version field: `schema_version: "lead-artifact.v1"`
-- Strict validation dependency: `jsonschema`
+- Strict validation dependency: `jsonschema`; calendar/timezone validation is built in and does not rely on optional format extras
+- RFC3339 offsets and arbitrary fractional seconds are ordered chronologically; leap-second timestamps are rejected explicitly
 - Invalid artifacts fail compile with explicit schema errors
 - Artifact paths stay inside the workspace and hostile inputs are size/depth bounded
 - High-confidence credential patterns fail closed before outputs are written
@@ -112,7 +110,7 @@ Scope intentionally not implemented yet:
 .\agentmd.cmd doctor
 .\agentmd.cmd resolve --task "review this repo for context drift"
 .\agentmd.cmd receipt
-.\agentmd.cmd run --adapter codex --task "review this repo for context drift"
+.\agentmd.cmd run --task "verify this checkout" -- python scripts/verify_local.py
 .\agentmd.cmd lead compile --task "compile ai work lead state" --artifact examples/lead-artifacts/run-codex.jsonl --artifact examples/lead-artifacts/run-claude.json --artifact examples/lead-artifacts/run-gemini.jsonl
 .\agentmd.cmd skill apply-edit --edit edits/validated-skill-edit.json
 ```
@@ -129,6 +127,15 @@ python -m pip install -r requirements-cli.txt
 python -m pytest -q tests/agentmd/test_agentmd_cli.py
 .\scripts\demo-lead-compile.ps1
 ```
+
+For real local evidence (not the canned parser demo):
+
+```bash
+python -m cli.agentmd run --task "verify this checkout" -- python scripts/verify_local.py
+python -m cli.agentmd lead compile --artifact .agentmd/verification/run.lead-artifact.json
+```
+
+The verification command runs the CLI checks, records actual Git diff/status and log hashes, and verifies selected context bytes before emitting its artifact. A zero-input compile reports zero evidence, never an invented run. See `docs/local_execution.md` for process, privacy, failure and sandbox boundaries.
 
 CI installs from `requirements-ci.lock` with package hashes and runs dependency and repository security scans. Trust scoring is advisory metadata; it never grants execution permission.
 

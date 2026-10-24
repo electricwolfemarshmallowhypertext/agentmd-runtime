@@ -11,14 +11,19 @@ This quickstart shows the minimum GitHub Actions integration for AgentMD current
 ## 1. Install dependencies
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements-cli.txt
-python -m pip install pytest pyyaml
+python -m pip install --only-binary=:all: --require-hashes -r requirements-ci.lock
 ```
 
 ## 2. Run compile from CI
 
-Use Lead Artifact inputs and compile a current-state packet:
+For evidence from the actual checkout, run local verification and compile its generated artifact:
+
+```powershell
+python -m cli.agentmd run --task "verify this checkout" -- python scripts/verify_local.py
+python -m cli.agentmd lead compile --artifact .agentmd/verification/run.lead-artifact.json
+```
+
+For a **canned input/format demo only** (not live model-provider proof):
 
 ```powershell
 .\agentmd.cmd lead compile --task "compile ai work lead state" --artifact examples/lead-artifacts/run-codex.jsonl --artifact examples/lead-artifacts/run-claude.json --artifact examples/lead-artifacts/run-gemini.jsonl
@@ -36,7 +41,7 @@ Upload generated outputs as workflow artifacts:
 
 ```yaml
 - name: Upload AgentMD proof artifacts
-  uses: actions/upload-artifact@v4
+  uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1; same pin as repository workflow
   with:
     name: agentmd-proof
     if-no-files-found: error
@@ -61,3 +66,5 @@ Upload generated outputs as workflow artifacts:
 - Missing required files fail with explicit `*_missing` messages.
 - Keep `if-no-files-found: error` in artifact upload so silent output loss fails fast.
 - On failure, capture step logs and uploaded artifacts from the last successful run for comparison.
+
+The legacy API audit has unresolved migration blockers; see `security_hardening_todo.md`. A passing compiler run is not a production release gate or authenticated truth proof.

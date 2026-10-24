@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import signal
+import threading
+import time
 import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +62,6 @@ STOPWORDS = {
     "context",
 }
 
-ADAPTER_INSTRUCTIONS = {
-    "codex": "codex --task \"{task}\" --context-file \"{context_file}\"",
-    "claude": "claude code --prompt \"{task}\" --context-file \"{context_file}\"",
-    "gemini": "gemini --prompt \"{task}\" --context-file \"{context_file}\"",
-}
 
 LEAD_ARTIFACT_SCHEMA_FILE = "schemas/lead-artifact.schema.json"
 SKILL_EDIT_SCHEMA_FILE = "schemas/skill-edit.schema.json"
@@ -116,6 +117,116 @@ def _atomic_write_text(path: Path, text: str) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def _atomic_write_bundle(root: Path, outputs: list[tuple[Path, str]]) -> None:
+    """Stage all outputs, then replace; roll back ordinary I/O failures.
+
+    This is not a filesystem transaction: concurrent writers and process/power
+    loss during replacement require external serialization/recovery.
+    """
+    staged: list[tuple[Path, Path, Path | None]] = []
+    replaced: list[tuple[Path, Path | None]] = []
+    recovery_backups: list[Path] = []
+    try:
+        # Validate every destination before creating directories or replacing files.
+        paths = [_require_path_within(p, root, "output_outside_workspace") for p, _ in outputs]
+        if len(set(paths)) != len(paths):
+            raise ValueError("output_bundle_duplicate_destination")
+        for path in paths:
+            if path.exists() and not path.is_file():
+                raise ValueError("output_destination_not_file")
+        for path, (_, content) in zip(paths, outputs):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            backup = None
+            with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".tmp") as tmp:
+                staged_path = Path(tmp.name)
+            staged.append((path, staged_path, backup))
+            staged_path.write_text(content, encoding="utf-8", newline="\n")
+            if path.exists():
+                with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".bak") as tmp:
+                    backup = Path(tmp.name)
+                staged[-1] = (path, staged_path, backup)
+                backup.write_bytes(path.read_bytes())
+        for path, staged_path, backup in staged:
+            _require_path_within(path, root, "output_outside_workspace")
+            staged_path.replace(path)
+            replaced.append((path, backup))
+    except (OSError, ValueError) as error:
+        rollback_failed = False
+        for path, backup in reversed(replaced):
+            try:
+                if backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    backup.replace(path)
+            except OSError:
+                rollback_failed = True
+                if backup is not None:
+                    recovery_backups.append(backup)
+        if rollback_failed:
+            paths = ", ".join(_display_path(root, path) for path in recovery_backups)
+            raise ValueError(f"output_bundle_rollback_failed: preserve recovery backups: {paths}") from error
+        raise ValueError("output_bundle_write_failed: prior output files preserved") from error
+    finally:
+        for _, staged_path, backup in staged:
+            staged_path.unlink(missing_ok=True)
+            if backup is not None and backup not in recovery_backups:
+                backup.unlink(missing_ok=True)
+
+
+def _timestamp_key(value: str) -> tuple[datetime, Decimal]:
+    """RFC3339 calendar timestamps, ordered by instant with exact fractional seconds.
+
+    Leap seconds are rejected (Python datetime has no leap-second time scale).
+    An empty timestamp is only for legacy context records with no event time.
+    """
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc), Decimal(0)
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})[Tt](\d{2}:\d{2}:\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})", value, flags=re.ASCII
+    )
+    if match is None:
+        raise ValueError("artifact_timestamp_invalid: expected RFC3339 date-time with timezone")
+    day, time, fraction, offset = match.groups()
+    # datetime accepts offsets like +01:60; RFC3339 does not.
+    if offset.upper() != "Z" and (int(offset[1:3]) > 23 or int(offset[4:6]) > 59):
+        raise ValueError("artifact_timestamp_invalid: invalid timezone offset")
+    try:
+        instant = datetime.fromisoformat(day + "T" + time + ("+00:00" if offset.upper() == "Z" else offset))
+        return instant.astimezone(timezone.utc), Decimal(fraction or "0")
+    except (ValueError, OverflowError) as error:
+        raise ValueError("artifact_timestamp_invalid: invalid calendar date-time") from error
+
+
+def _format_checker() -> Any:
+    jsonschema = _require_jsonschema()
+    checker = jsonschema.FormatChecker()
+
+    @checker.checks("date-time", raises=ValueError)
+    def date_time(value: Any) -> bool:
+        if not isinstance(value, str):
+            return True  # The schema type constraint reports non-strings.
+        if not value:
+            return False
+        _timestamp_key(value)
+        return True
+
+    return checker
+
+
+def _schema_error_summary(error: Any) -> str:
+    # Never include instance values or instance property names in diagnostics.
+    # Schema paths/required field names come from the bundled trusted schema.
+    location = "/".join(str(part) for part in error.absolute_schema_path)
+    if error.validator == "required":
+        missing = [key for key in error.validator_value if key not in error.instance]
+        detail = "missing required fields: " + ", ".join(missing)
+    elif error.validator == "additionalProperties":
+        detail = "Additional properties are not allowed"
+    else:
+        detail = "constraint failed: " + str(error.validator)
+    return f"schema/{location} ({detail})"
 
 
 def _require_path_within(path: Path, parent: Path, error_code: str) -> Path:
@@ -195,7 +306,7 @@ def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _load_config(root: Path) -> dict[str, Any]:
-    path = root / "agentmd.yaml"
+    path = _require_path_within(root / "agentmd.yaml", root, "config_outside_workspace")
     if not path.exists():
         return dict(DEFAULT_CONFIG)
     try:
@@ -277,13 +388,19 @@ def _check_jsonl(path: Path) -> tuple[bool, str]:
 
 
 def _discover_context_files(root: Path) -> dict[str, list[Path]]:
-    return {
+    for name in ("AGENTS.md", "skills", "memory", "policies", "evals", "receipts"):
+        _require_path_within(root / name, root, "context_root_outside_workspace")
+    files = {
         "agents": [root / "AGENTS.md"],
         "skills": sorted((root / "skills").glob("*/SKILL.md")),
         "memory": sorted((root / "memory").glob("*")),
         "policies": sorted((root / "policies").glob("*")),
         "evals": sorted((root / "evals").glob("*")),
     }
+    for paths in files.values():
+        for path in paths:
+            _require_path_within(path, root, "context_file_outside_workspace")
+    return files
 
 
 def validate_workspace(root: Path) -> dict[str, Any]:
@@ -638,6 +755,7 @@ def write_receipt(
     task: str | None = None,
     adapter: str | None = None,
     phase: str | None = None,
+    execution: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     validation = validate_workspace(root)
     resolved, resolved_path = _load_resolved(root)
@@ -690,6 +808,8 @@ def write_receipt(
             "warnings": [*validation["warnings"], *receipt_warnings],
         },
     }
+    if execution is not None:
+        receipt["execution"] = {**execution, "workspace_validation_ok": validation["ok"]}
     receipt_material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(receipt_material).hexdigest()
 
@@ -734,16 +854,9 @@ def _require_jsonschema() -> Any:
 
 def _validate_json_payload(payload: dict[str, Any], schema: dict[str, Any], error_prefix: str) -> list[str]:
     jsonschema = _require_jsonschema()
-    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
-    out: list[str] = []
-    for err in errors:
-        if err.path:
-            ptr = ".".join(str(part) for part in err.path)
-        else:
-            ptr = "$"
-        out.append(f"{error_prefix} at {ptr} ({err.message})")
-    return out
+    validator = jsonschema.Draft202012Validator(schema, format_checker=_format_checker())
+    errors = sorted(validator.iter_errors(payload), key=lambda e: str(list(e.absolute_schema_path)))
+    return [f"{error_prefix} at {_schema_error_summary(err)}" for err in errors]
 
 
 def _load_skill_edit_payload(root: Path, edit_path: Path) -> dict[str, Any]:
@@ -801,9 +914,10 @@ def _load_skill_validation_receipt(
     receipt_path = Path(receipt_path_raw)
     if receipt_path.is_absolute():
         raise ValueError("skill_validation_receipt_absolute_path_forbidden")
+    validation_root = _require_path_within(root / "evals" / "skill-validation", root, "skill_validation_root_outside_workspace")
     receipt_file = _require_path_within(
         root / receipt_path,
-        root / "evals" / "skill-validation",
+        validation_root,
         "skill_validation_receipt_outside_evals",
     )
     if receipt_file.suffix.lower() != ".json" or not receipt_file.is_file():
@@ -846,7 +960,8 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     skill_path = Path(skill_path_raw)
     if skill_path.is_absolute():
         raise ValueError("skill_edit_absolute_path_forbidden")
-    skill_file = _require_path_within(root / skill_path, root / "skills", "skill_edit_path_outside_skills")
+    skills_root = _require_path_within(root / "skills", root, "skill_root_outside_workspace")
+    skill_file = _require_path_within(root / skill_path, skills_root, "skill_edit_path_outside_skills")
     relative_skill_path = skill_file.relative_to((root / "skills").resolve())
     if len(relative_skill_path.parts) != 2 or relative_skill_path.name != "SKILL.md":
         raise ValueError("skill_edit_path_must_match: skills/<skill-name>/SKILL.md")
@@ -941,6 +1056,7 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     return "rejected", rejection_path, base_record
 
 
+LEAD_TERMINAL_LOOP_STATUSES = {"closed", "completed", "done", "resolved", "cancelled", "canceled"}
 LEAD_VERIFIED_STATUSES = {"verified", "true", "confirmed", "pass", "passed"}
 LEAD_UNVERIFIED_STATUSES = {"unverified", "unknown", "pending", "needs_verification", "partial"}
 LEAD_CONTRADICTORY_STATUSES = {"contradicted", "false", "failed", "fail", "rejected"}
@@ -1007,8 +1123,9 @@ def _lead_check_json_depth(value: Any, source: str) -> None:
 def _lead_secret_findings(value: Any, path: str = "$") -> list[str]:
     findings: list[str] = []
     if isinstance(value, dict):
-        for key, item in value.items():
-            findings.extend(_lead_secret_findings(item, f"{path}.{key}"))
+        for index, (key, item) in enumerate(value.items()):
+            findings.extend(_lead_secret_findings(str(key), f"{path}[key:{index}]"))
+            findings.extend(_lead_secret_findings(item, f"{path}[value:{index}]"))
     elif isinstance(value, list):
         for index, item in enumerate(value):
             findings.extend(_lead_secret_findings(item, f"{path}[{index}]"))
@@ -1191,18 +1308,10 @@ def _lead_validate_artifact_schema(root: Path, raw: dict[str, Any], source_ref: 
             "lead_artifact_schema_dependency_missing: jsonschema is required; install requirements-cli.txt"
         ) from e
 
-    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = sorted(validator.iter_errors(raw), key=lambda e: list(e.path))
-    out: list[str] = []
-    for err in errors:
-        if err.path:
-            ptr = ".".join(str(part) for part in err.path)
-        else:
-            ptr = "$"
-        out.append(f"lead_artifact_schema_invalid: {source_ref} at {ptr} ({err.message})")
-    for finding in _lead_secret_findings(raw):
-        out.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
-    return out
+    findings = _lead_secret_findings(raw)
+    if findings:
+        return [f"lead_artifact_secret_detected: {source_ref} at {finding}" for finding in findings]
+    return _validate_json_payload(raw, schema, f"lead_artifact_schema_invalid: {source_ref}")
 
 
 def _lead_extract_files_touched(raw: dict[str, Any]) -> list[str]:
@@ -1346,8 +1455,16 @@ def _lead_normalize_artifact(
 
     task = str(raw.get("task") or "").strip()
     timestamp = str(raw.get("timestamp") or raw.get("generated_at") or "").strip()
+    _timestamp_key(timestamp)
     adapter = str(raw.get("adapter") or raw.get("tool") or raw.get("chat") or raw.get("agent") or "").strip()
-    verification_status = _lead_status(raw.get("verification_status") or ((raw.get("validation") or {}).get("ok")))
+    verification_status = _lead_status(raw.get("verification_status"))
+    execution = raw.get("execution")
+    if isinstance(execution, dict):
+        success = (execution.get("status") == "completed" and execution.get("launched") is True
+                   and execution.get("returncode") == 0 and (raw.get("validation") or {}).get("ok") is True)
+        verification_status = "verified" if success else "contradicted"
+        if not success:
+            open_loops.append({"text": "Investigate local execution outcome: " + str(execution.get("status") or "unknown"), "status": "open"})
 
     needs_human_approval = _lead_to_str_list(raw.get("human_approval_items"))
     needs_human_approval.extend(_lead_to_str_list(raw.get("needs_human_approval")))
@@ -1376,6 +1493,7 @@ def _lead_normalize_artifact(
         "contradictions": contradictions,
         "needs_human_approval": needs_human_approval,
         "verification_status": verification_status,
+        "execution": execution if isinstance(execution, dict) else None,
         "context_bundle_hash": str(raw.get("context_bundle_hash") or "") or None,
         "receipt_hash": str(raw.get("receipt_hash") or "") or None,
         "source_artifacts": _lead_to_str_list(raw.get("source_artifacts")),
@@ -1394,10 +1512,8 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
 
     discovered: list[Path] = []
     discovered.extend(sorted((root / "receipts").glob("*.jsonl")))
-    discovered.extend(sorted((root / ".sticky" / "receipts").glob("*.jsonl")))
-    resolved = root / ".agentmd" / "resolved-context.json"
-    if resolved.exists():
-        discovered.append(resolved)
+    # Compiler receipts and context manifests are provenance, not new tool runs.
+    # Feeding them back would manufacture evidence and recursively inflate state.
     contained = [_require_path_within(p, root, "artifact_path_outside_workspace") for p in discovered]
     unique = sorted({str(p): p for p in contained}.values(), key=lambda p: str(p).lower())
     return unique
@@ -1406,38 +1522,9 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
 def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_override: str | None) -> dict[str, Any]:
     validation = validate_workspace(root)
 
-    if not artifacts:
-        default_task = (task_override or "").strip()
-        synthetic_id_source = default_task or "no-artifacts"
-        synthetic = {
-            "run_id": hashlib.sha256(synthetic_id_source.encode("utf-8")).hexdigest()[:16],
-            "timestamp": "",
-            "source_artifact": "none",
-            "task": default_task or None,
-            "adapter": None,
-            "files_touched": [],
-            "claims_made": [],
-            "decisions_made": [],
-            "open_loops": [],
-            "contradictions": [],
-            "needs_human_approval": [],
-            "verification_status": "unknown",
-            "context_bundle_hash": None,
-            "receipt_hash": None,
-            "git_state": {
-                "available": False,
-                "commit": None,
-                "dirty": None,
-                "changed_files": [],
-                "untracked_files": [],
-                "reason": "no_artifacts",
-            },
-        }
-        artifacts = [synthetic]
-
     artifacts_sorted = sorted(
         artifacts,
-        key=lambda a: (str(a.get("timestamp") or ""), str(a.get("run_id") or ""), str(a.get("source_artifact") or "")),
+        key=lambda a: (_timestamp_key(str(a.get("timestamp") or "")), str(a.get("run_id") or ""), str(a.get("source_artifact") or "")),
     )
 
     task_candidates = [str(a.get("task") or "").strip() for a in artifacts_sorted if a.get("task")]
@@ -1505,17 +1592,19 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
     true_claims = _lead_dedupe_sorted(true_claims)
     unverified_claims = _lead_dedupe_sorted(unverified_claims)
 
-    next_clean_action = "Proceed to the next scoped task."
+    next_clean_action = "Proceed to the next scoped task." if artifacts_sorted else "Collect a tool-run artifact before choosing the next task."
     if needs_human_approval:
         next_clean_action = "Resolve human-approval items before the next run."
     elif contradictions:
         next_clean_action = "Resolve contradictions and update verified state."
     elif unverified_claims:
         next_clean_action = "Verify unverified claims."
-    elif open_loops:
-        next_clean_action = f"Close open loop: {open_loops[0]['text']}"
+    else:
+        active_loops = [loop for loop in open_loops if loop["status"].strip().lower() not in LEAD_TERMINAL_LOOP_STATUSES]
+        if active_loops:
+            next_clean_action = f"Close open loop: {active_loops[0]['text']}"
 
-    latest = artifacts_sorted[-1]
+    latest = artifacts_sorted[-1] if artifacts_sorted else {}
     latest_context_bundle_hash = None
     latest_receipt_hash = None
     for artifact in reversed(artifacts_sorted):
@@ -1542,6 +1631,7 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
         "version": "0.2",
         "primitive": "ai_work_lead",
         "input_trust": "untrusted",
+        "evidence_status": "asserted_sources" if artifacts_sorted else "no_evidence",
         "task": task,
         "artifacts_ingested": len(artifacts_sorted),
         "artifact_sources": sorted({str(a.get("source_artifact") or "") for a in artifacts_sorted if a.get("source_artifact")}),
@@ -1594,8 +1684,6 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
         },
     }
 
-    material = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    packet["deterministic_hash"] = hashlib.sha256(material).hexdigest()
     return packet
 
 
@@ -1622,6 +1710,8 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     md: list[str] = [
         "# Sticky Current State",
         "",
+        "Evidence: source assertions only; hashes verify integrity, not the truth of claims.",
+        "",
         f"Task: {_markdown_untrusted(packet.get('task'))}",
         f"Deterministic Hash: {packet.get('deterministic_hash')}",
         f"Artifacts Ingested: {packet.get('artifacts_ingested')}",
@@ -1629,7 +1719,7 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     ]
 
     md.extend(lines_for_list("What Changed", current.get("what_changed", [])))
-    md.extend(lines_for_list("What Is True", current.get("what_is_true", [])))
+    md.extend(lines_for_list("Source-Reported Verified Claims", current.get("what_is_true", [])))
     md.extend(lines_for_list("What Is Unverified", current.get("what_is_unverified", [])))
     md.extend(lines_for_list("What Contradicts Prior State", current.get("what_contradicts_prior_state", [])))
     md.extend(lines_for_list("What Needs Human Approval", current.get("what_needs_human_approval", [])))
@@ -1734,21 +1824,23 @@ def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[
         return None, []
 
     warnings: list[str] = []
-    for path in reversed(sorted(receipts_dir.glob("*.jsonl"))):
+    latest: dict[str, Any] | None = None
+    expected_previous: str | None = None
+    for path in sorted(receipts_dir.glob("*.jsonl")):
         try:
             path = _require_path_within(path, root, "receipt_history_outside_workspace")
         except ValueError:
-            warnings.append(f"receipt_history_outside_workspace: {_display_path(root, path)}")
+            warnings.append("receipt_history_outside_workspace")
             continue
         if path.stat().st_size > LEAD_MAX_ARTIFACT_BYTES:
             warnings.append(f"receipt_history_too_large: {_display_path(root, path)}")
             continue
         try:
             lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        except OSError:
+        except (OSError, UnicodeError):
             warnings.append(f"receipt_history_unreadable: {_display_path(root, path)}")
             continue
-        for line in reversed(lines):
+        for line in lines:
             try:
                 receipt = _strict_json_loads(line)
             except (json.JSONDecodeError, ValueError):
@@ -1757,8 +1849,12 @@ def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[
             if not isinstance(receipt, dict) or not _receipt_hash_matches(receipt):
                 warnings.append(f"receipt_history_hash_mismatch: {_display_path(root, path)}")
                 continue
-            return receipt, warnings
-    return None, warnings
+            if receipt.get("previous_receipt_hash") != expected_previous:
+                warnings.append(f"receipt_history_chain_mismatch: {_display_path(root, path)}")
+                continue
+            latest = receipt
+            expected_previous = str(receipt["receipt_hash"])
+    return latest, warnings
 
 
 def _lead_latest_trust_history(
@@ -1882,7 +1978,7 @@ def _lead_build_trust_report(
     )
 
 
-def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) -> tuple[Path, dict[str, Any]]:
+def _lead_prepare_receipt(root: Path, packet: dict[str, Any], command_run: str) -> tuple[Path, dict[str, Any]]:
     proof = packet.get("proof", {})
     git_state = proof.get("git_state", {})
     timestamp = datetime.now(timezone.utc)
@@ -1918,11 +2014,11 @@ def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) ->
     material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(material).hexdigest()
 
-    receipts_dir = root / ".sticky" / "receipts"
-    receipts_dir.mkdir(parents=True, exist_ok=True)
+    receipts_dir = _require_path_within(root / ".sticky" / "receipts", root, "lead_receipt_output_outside_workspace")
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
     out_path = _require_path_within(receipts_dir / filename, root, "lead_receipt_output_outside_workspace")
-    _atomic_write_text(out_path, json.dumps(receipt) + "\n")
+    if out_path.exists():
+        raise ValueError("lead_receipt_already_exists")
     return out_path, receipt
 
 
@@ -1932,6 +2028,8 @@ def compile_lead_state(
     artifact_paths: list[Path],
     validate_artifacts: bool = False,
 ) -> tuple[dict[str, Any], Path, Path, Path, dict[str, Any]]:
+    if _lead_secret_findings(task_override):
+        raise ValueError("lead_artifact_secret_detected: task override")
     artifacts: list[dict[str, Any]] = []
     warnings: list[str] = []
     schema_errors: list[str] = []
@@ -1940,7 +2038,13 @@ def compile_lead_state(
         source_sha256 = _sha256_file(artifact_path) if loaded_records else ""
         warnings.extend(loaded_warnings)
         for idx, (raw, source_ref) in enumerate(loaded_records, start=1):
-            if validate_artifacts:
+            if not validate_artifacts:
+                if raw.get("phase") == "pre":
+                    continue  # Prepared is not evidence that a command executed.
+                if raw.get("schema_version") != "lead-artifact.v1" and not isinstance(raw.get("execution"), dict):
+                    warnings.append(f"artifact_metadata_not_run_evidence: {source_ref}")
+                    continue
+            if validate_artifacts or raw.get("schema_version") == "lead-artifact.v1":
                 try:
                     schema_errors.extend(_lead_validate_artifact_schema(root, raw, source_ref))
                 except ValueError as e:
@@ -1948,6 +2052,15 @@ def compile_lead_state(
             else:
                 for finding in _lead_secret_findings(raw):
                     schema_errors.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
+                execution = raw.get("execution") or {}
+                if (raw.get("phase") != "post" or not _receipt_hash_matches(raw)
+                    or execution.get("status") not in {"completed", "failed", "launch_failed", "timed_out", "output_limit_exceeded", "output_stream_incomplete", "interrupted"}
+                    or not isinstance(execution.get("launched"), bool)
+                    or not isinstance(raw.get("validation"), dict)
+                    or not isinstance((raw.get("validation") or {}).get("ok"), bool)):
+                    schema_errors.append(f"lead_execution_receipt_invalid: {source_ref}")
+            if schema_errors:
+                continue
             artifacts.append(
                 _lead_normalize_artifact(
                     raw,
@@ -1960,11 +2073,11 @@ def compile_lead_state(
     if validate_artifacts and warnings:
         raise ValueError("; ".join(warnings))
 
-    if validate_artifacts and not artifacts:
-        raise ValueError("lead_artifact_input_empty: no valid artifact records loaded")
-
     if schema_errors:
         raise ValueError("; ".join(schema_errors))
+
+    if validate_artifacts and not artifacts:
+        raise ValueError("lead_artifact_input_empty: no valid artifact records loaded")
 
     run_ids = [str(item.get("run_id") or "") for item in artifacts]
     duplicate_run_ids = sorted({run_id for run_id in run_ids if run_id and run_ids.count(run_id) > 1})
@@ -1980,14 +2093,20 @@ def compile_lead_state(
                 merged = sorted({*current_warnings, *warnings})
                 validation["warnings"] = merged
 
+    if not packet["validation"]["ok"]:
+        raise ValueError("lead_workspace_validation_failed: " + "; ".join(packet["validation"]["errors"]))
+    material = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    packet["deterministic_hash"] = hashlib.sha256(material).hexdigest()
+
     sticky_dir = _require_path_within(root / ".sticky", root, "lead_output_outside_workspace")
-    sticky_dir.mkdir(parents=True, exist_ok=True)
     json_path = _require_path_within(sticky_dir / "current-state.json", root, "lead_output_outside_workspace")
     md_path = _require_path_within(sticky_dir / "current-state.md", root, "lead_output_outside_workspace")
-    _atomic_write_text(json_path, json.dumps(packet, indent=2))
-    _atomic_write_text(md_path, _lead_current_state_markdown(packet))
-
-    receipt_path, receipt = _lead_write_receipt(root, packet, command_run="agentmd lead compile")
+    receipt_path, receipt = _lead_prepare_receipt(root, packet, command_run="agentmd lead compile")
+    _atomic_write_bundle(root, [
+        (json_path, json.dumps(packet, indent=2)),
+        (md_path, _lead_current_state_markdown(packet)),
+        (receipt_path, json.dumps(receipt) + "\n"),
+    ])
     return packet, json_path, md_path, receipt_path, receipt
 
 
@@ -2093,34 +2212,149 @@ def receipt(
     typer.echo(f"receipt_hash: {data['receipt_hash']}")
 
 
+def _execute_local_command(root: Path, argv: list[str], context: Path, task: str, timeout: float, output_limit: int) -> dict[str, Any]:
+    """Execute explicit argv; hash bounded output without retaining or displaying it.
+
+    This is execution with the caller's privileges/environment, NOT a sandbox.
+    """
+    result: dict[str, Any] = {"status": "launch_failed", "launched": False, "returncode": None}
+    exceeded = threading.Event()
+    streams: dict[str, dict[str, Any]] = {}
+    env = dict(os.environ)
+    env.update(AGENTMD_CONTEXT_FILE=str(context), AGENTMD_TASK=task)
+    try:
+        process = subprocess.Popen(
+            argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+            start_new_session=(os.name == "posix"),
+        )
+    except (OSError, ValueError):
+        return result
+    result["launched"] = True
+
+    def digest_stream(name: str, pipe: Any) -> None:
+        digest = hashlib.sha256()
+        count = 0
+        complete = False
+        try:
+            while True:
+                chunk = pipe.read1(65536)
+                if not chunk:
+                    complete = True
+                    break
+                remaining = max(0, output_limit - count)
+                digest.update(chunk[:remaining])
+                count += len(chunk)
+                if count > output_limit:
+                    exceeded.set()
+                    break
+        except (OSError, ValueError):
+            complete = False
+        finally:
+            streams[name] = {"sha256": digest.hexdigest(), "bytes_observed": count, "hashed_bytes": min(count, output_limit), "complete": complete}
+
+    readers = [threading.Thread(target=digest_stream, args=(name, pipe), daemon=True)
+               for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr))]
+    for reader in readers:
+        reader.start()
+
+    def terminate() -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    status = "completed"
+    try:
+        while process.poll() is None:
+            if exceeded.is_set():
+                status = "output_limit_exceeded"
+                terminate()
+                break
+            if time.monotonic() >= deadline:
+                status = "timed_out"
+                terminate()
+                break
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        status = "interrupted"
+        terminate()
+    process.wait()
+    for reader in readers:
+        reader.join(timeout=0.5)
+    if any(reader.is_alive() for reader in readers):
+        terminate()  # Clean up POSIX descendants that inherited output pipes.
+        for reader in readers:
+            reader.join(timeout=0.5)
+        status = "output_stream_incomplete"
+    elif exceeded.is_set() and status == "completed":
+        status = "output_limit_exceeded"
+    elif status == "completed" and (len(streams) != 2 or not all(item["complete"] for item in streams.values())):
+        status = "output_stream_incomplete"
+    if status == "completed" and process.returncode != 0:
+        status = "failed"
+    result.update(status=status, returncode=process.returncode, output=streams)
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None and not any(reader.is_alive() for reader in readers):
+            pipe.close()
+    return result
+
+
 @app.command()
 def run(
-    adapter: str = typer.Option(..., "--adapter", help="Adapter to launch: codex|claude|gemini"),
-    task: str = typer.Option(..., "--task", help="Task to execute"),
+    task: str = typer.Option(..., "--task", help="Task passed as AGENTMD_TASK, never interpolated into a shell"),
     root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    adapter: str | None = typer.Option(None, "--adapter", help="Optional caller-asserted label; does not select provider commands"),
+    timeout: float = typer.Option(300.0, "--timeout", min=0.1, max=3600.0, help="Maximum child runtime in seconds"),
+    output_limit: int = typer.Option(1048576, "--output-limit", min=1024, max=16777216, help="Maximum hashed bytes per stdout/stderr stream"),
+    command: list[str] = typer.Argument(None, help="Explicit executable and arguments after -- (no shell)"),
 ) -> None:
+    if not math.isfinite(timeout):
+        raise typer.BadParameter("timeout must be finite")
+    if not command:
+        raise typer.BadParameter("provide an explicit command after --; adapters are labels, not integrations")
     root = root.resolve()
-    adapter = adapter.lower().strip()
-    if adapter not in ADAPTER_INSTRUCTIONS:
-        raise typer.BadParameter("adapter must be one of: codex, claude, gemini")
-
-    resolve_context(root, task)
-    write_receipt(root, command_run=f"agentmd run --adapter {adapter} --task {task}", task=task, adapter=adapter, phase="pre")
-
-    context_file = ".agentmd/resolved-context.json"
-    launch = ADAPTER_INSTRUCTIONS[adapter].format(task=task.replace('"', '\\"'), context_file=context_file)
-    typer.echo("agentmd run v1 does not execute adapters yet.")
-    typer.echo(f"launch_instruction: {launch}")
-
-    out_path, data = write_receipt(
-        root,
-        command_run=f"agentmd run --adapter {adapter} --task {task}",
-        task=task,
-        adapter=adapter,
-        phase="post",
-    )
+    try:
+        if _lead_secret_findings({"task": task, "adapter": adapter}):
+            raise ValueError("run_secret_detected: do not put credentials in recorded task or adapter labels")
+        validation = validate_workspace(root)
+        if not validation["ok"]:
+            raise ValueError("run_workspace_validation_failed: " + "; ".join(validation["errors"]))
+        receipts_dir = _require_path_within(root / "receipts", root, "receipt_output_outside_workspace")
+        if receipts_dir.exists() and not receipts_dir.is_dir():
+            raise ValueError("receipt_output_not_directory")
+        resolved, context = resolve_context(root, task)
+        execution = {
+            "argv_sha256": hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest(),
+            "argc": len(command), "cwd": str(root),
+            "context_manifest_sha256": _sha256_file(context),
+            "context_bundle_hash": resolved["context_bundle_hash"],
+            "timeout_seconds": timeout, "output_limit_bytes_per_stream": output_limit,
+            "status": "prepared", "launched": False,
+            "privacy": "argv and output are hash-only; environment inherited; not sandboxed",
+        }
+        _, before = write_receipt(root, command_run="agentmd run", task=task, adapter=adapter, phase="pre", execution=execution)
+        outcome = _execute_local_command(root, command, context, task, timeout, output_limit)
+        execution = {**execution, **outcome, "pre_receipt_hash": before["receipt_hash"]}
+        out_path, data = write_receipt(root, command_run="agentmd run", task=task, adapter=adapter, phase="post", execution=execution)
+    except (ValueError, OSError) as error:
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    typer.echo(f"execution_status: {execution['status']}")
+    typer.echo(f"returncode: {execution['returncode']}")
+    typer.echo(f"workspace_validation_ok: {data['validation']['ok']}")
     typer.echo(f"receipt: {_relative(root, out_path)}")
     typer.echo(f"receipt_hash: {data['receipt_hash']}")
+    if execution["status"] in {"completed", "failed"}:
+        code = int(execution["returncode"] or 0)
+        if code == 0 and not data["validation"]["ok"]:
+            code = 1
+        raise typer.Exit(code=code if code >= 0 else 128 - code)
+    raise typer.Exit(code={"launch_failed": 127, "timed_out": 124, "interrupted": 130}.get(execution["status"], 125))
 
 
 if __name__ == "__main__":

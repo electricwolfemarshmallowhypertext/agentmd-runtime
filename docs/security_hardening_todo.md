@@ -1,87 +1,44 @@
-# AgentMD Security Hardening TODO
+# Security hardening status and remaining gates
 
-Status: local hardening verified; public repository remediation pending
+Updated 2026-10-24. Separate historical cleanup, local fixes, and unverified administration.
 
-This checklist records the September 2026 security audit and is the gate for the
-next network operation or release.
+## Published source baseline
 
-## Remote finding
+The September audit originally inspected an older remote head (`0d4eab0`) with canary/hooks/package files. That historical inventory is not the current tree. Published `v0.3.0-alpha.3`/main baseline `6602fc4874c1824faa4d2fd23d3ec560fd39db21` contains no root `canary.js`, root `package.json`, or `.githooks/`; adoption, exit-code, determinism, receipt and threat-model docs are restored. September 29 exact-commit CI logged 41 passing CLI tests and then-current audits.
 
-- Last inspected remote head: `origin/main` at `0d4eab0`.
-- Clean merge base: `c498d47653761b351a3fe0ba441f3fa9e92c431b`.
-- Divergence at inspection: local branch 1 commit ahead; remote 23 commits ahead.
-- The 23 remote-only commits are unsigned and share the message `chore: sync editor configuration`.
-- Remote-only files: `.githooks/pre-commit`, `.githooks/post-merge`, `canary.js`, and `package.json`.
-- The hook and npm lifecycle scripts decode and invoke an outbound HTTP command.
-- Those files are absent locally, `core.hooksPath` is unset, and only sample hooks exist in `.git/hooks`.
+This does **not** establish historical credential safety or account cleanup:
 
-## P0: Repository containment
+- [ ] Independently confirm unauthorized apps/tokens/deploy keys/sessions/webhooks were audited and revoked.
+- [ ] Confirm credential rotation where needed; no production credentials were inspected in this local repair.
+- [ ] Require substantive review/signature enforcement before release. The observed main ruleset required PR/checks but zero reviewer approvals; the release tag was unsigned.
 
-- [x] Fetch and inspect `origin/main` without merging it.
-- [x] Confirm the local working tree does not contain the outbound canary files.
-- [x] Confirm no custom Git hooks are active locally.
-- [x] Isolate work on `codex/security-hardening-2026` from the last clean lineage.
-- [ ] Remove `.githooks/`, `canary.js`, and the introduced `package.json` from public `main`.
-- [ ] Restore trust/adoption documentation deleted by the remote commits.
-- [ ] Audit and revoke unauthorized GitHub apps, tokens, deploy keys, sessions, and webhooks.
-- [ ] Protect `main` with reviewed changes and signed provenance.
+## October local branch fixes (unreleased)
 
-## P0: File mutation boundaries
+- Final packet hashes cover warning fields and receipts bind that final hash.
+- Timestamp format/calendar validation works without optional jsonschema extras; ordering uses UTC instant, including exact fractional seconds.
+- Failed workspace validation prevents lead output replacement.
+- Bundle preflight/staging/ordinary-error rollback preserves prior outputs; failed rollback retains recovery backups. No power-loss/concurrent-writer atomicity claim.
+- Synthetic secret-shaped keys and values are rejected without echo; schema diagnostics omit instance values.
+- Terminal loops are not recommended for closure.
+- Nested skill/evaluator roots are checked against the workspace. The previously blocked specific skill-root symlink probe was not rerun; no runtime proof for that probe is claimed.
+- Receipt history must have valid hashes and continuous retained predecessor links; unsigned replacement/recomputation remains possible.
+- Empty discovery remains zero evidence, compiler receipts do not feed themselves back, and prepared receipts are not successful execution evidence.
+- Local `run` now executes explicit argv and records actual failures/timeouts; it is not a sandbox/provider integration.
 
-- [x] Restrict skill edits to workspace-local `skills/*/SKILL.md` files.
-- [x] Reject absolute paths, traversal, and symlink escapes.
-- [x] Write accepted skill edits atomically and verify the resulting hash.
-- [x] Require hash-bound validation evidence before accepting an edit.
+## Dependency gate — not yet green
 
-## P1: Hostile artifact handling
+The October advisory refresh found new issues despite September's successful audits.
 
-- [x] Enforce artifact byte, record, nesting, string, and collection limits.
-- [x] Reject malformed JSONL atomically instead of partially compiling it.
-- [x] Restrict artifact paths to the workspace unless explicitly trusted later.
-- [x] Reject symlink escapes and duplicate run IDs.
-- [x] Keep executable and binary serialization formats unsupported.
+- CLI/CI lock: certifi updated to `2026.10.19`, filelock to `4.2.1`; hash-lock installation and current audit must pass on the final branch. Colorama is retained explicitly for Windows hash-locked installs.
+- Legacy API: unused `python-jose` removed (Firebase Admin handles token verification); aiohttp updated to `3.14.4`, Black to `26.10.1` with focused genuine local smoke checks.
+- **Blocked: sentence-transformers `2.2.2`.** The scanner suggests `5.6.0`, but upstream says trust enforcement for local custom modules begins in `6.0.0`. A blind major upgrade is not compatibility evidence. Existing API issues include the memory-engine exception import, legacy Chroma configuration, and 384-vs-1024 embedding dimensions. A real local-model/storage migration is needed; no model was downloaded or invoked for this repair.
+- **Coordinated OpenTelemetry/Firestore update:** API/SDK/OTLP exporter `1.45.1`, instrumentation `0.66b1`, Firestore `2.34.1`, protobuf `6.33.6`. The old Firestore `<5` protobuf conflict was resolved by a tested compatible Firestore update. Real offline client/protobuf roundtrips and instrumented HTTP/in-memory span export passed with existing Firebase Admin/AI Platform pins; this is not a live Firestore service or full API boot test.
+- The API direct audit remains intentionally failing while those pins remain; the CI gate has not been removed/ignored. Direct auditing does not cover full transitive installation or production reachability.
 
-## P1: Schema hardening
+## Required before release
 
-- [x] Close undeclared top-level Lead Artifact fields.
-- [x] Validate RFC 3339 timestamps and SHA-256 hash formats.
-- [x] Add practical `maxLength` and `maxItems` constraints.
-- [x] Add stable claim/evidence provenance fields without weakening v1 validation.
-
-## P1: Receipt and trust integrity
-
-- [x] Verify historical receipt hashes before consuming trust history.
-- [x] Chain receipts with `previous_receipt_hash`.
-- [x] Bind artifact hashes to receipts.
-- [x] Deduplicate trust observations by artifact hash and `run_id`.
-- [x] Separate asserted claim status from evaluator-observed status.
-- [x] Keep trust advisory; never use it as execution authorization.
-- [x] Document that asymmetric signing and external attestation remain future work.
-
-## P1: Prompt-injection containment
-
-- [x] Mark imported artifact content as untrusted data with per-claim provenance.
-- [x] Sanitize generated Markdown/HTML output.
-- [x] Prevent artifact text from becoming commands, policy, or permissions.
-- [x] Preserve explicit human-approval items; AgentMD v0.x does not execute sensitive actions.
-
-## P1: CI and dependency supply chain
-
-- [x] Pin GitHub Actions to verified full commit SHAs.
-- [x] Set workflow permissions to `contents: read`.
-- [x] Disable checkout credential persistence.
-- [x] Add job timeouts.
-- [x] Install dependencies from a hash-locked requirements file.
-- [x] Remove unpinned workflow-only Python installs and pip self-upgrades.
-- [x] Add dependency auditing and repository secret/indicator scanning gates.
-- [x] Upload only allowlisted proof artifacts.
-
-## Release gate
-
-- [x] `python -m py_compile cli/agentmd.py scripts/security_scan.py`
-- [x] `python -m pytest -q tests/agentmd/test_agentmd_cli.py` (`36 passed` on Python 3.11)
-- [x] `./scripts/demo-lead-compile.ps1`
-- [x] Dependency audit passes (`pip-audit`: no known vulnerabilities).
-- [x] Security regression tests pass.
-- [x] Final diff contains no outbound canary indicators or secrets.
-- [ ] No push, tag, or release until the local gate is complete.
+- [ ] Resolve remaining legacy API dependency gates, or obtain an explicit product/support-scope decision; do not silently suppress the gate.
+- [ ] Re-run fresh hash-locked install, CLI outcomes, real local verification artifact, compiler repeat/integrity checks and all dependency audits on the final candidate.
+- [ ] Run new behavior and wrappers natively on Windows/Python 3.11; Linux verification is not a Windows claim.
+- [ ] Review local diff, unsigned-receipt limitations and all account-level unknowns.
+- [ ] Obtain separate authorization for push, PR, merge, tag or release.
