@@ -45,3 +45,9 @@ Placeholder policy (to finalize before stable release):
 - minimum deprecation window: `TBD` (recommend >= 90 days)
 - migration note required for every deprecation
 - removal only after deprecation window ends and migration guidance is published
+
+## October 2026 unreleased correction notes
+
+The former `run --adapter ...` command only printed a guessed invocation. It now requires explicit argv after `--`; `--adapter` is only an optional label. Migrate to the documented local-command contract in `local_execution.md`; provider integrations are not silently selected.
+
+Compiler output adds `evidence_status` and preserves execution outcomes. `what_is_true` remains for schema compatibility but is labelled source-reported verified claims in Markdown. Metadata-only/context/compiler/prepared receipts do not count as tool-run evidence; an empty discovery stays zero evidence. Invalid RFC3339 timestamps and failed required workspace validation now fail as the existing contract promised. Terminal loop status aliases are documented without narrowing the v1 input schema.

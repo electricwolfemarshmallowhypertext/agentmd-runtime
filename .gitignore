@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 __pycache__/
 .pytest_cache/
 .tmp/
@@ -25,3 +25,4 @@ data/
 # Local audit planning
 TODO.local.md
 .agentmd/identity/
+.agentmd/verification/

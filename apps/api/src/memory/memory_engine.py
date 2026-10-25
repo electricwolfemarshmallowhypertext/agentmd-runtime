@@ -1,534 +1,388 @@
-"""
-Memory Engine with Vector Storage and Persistence
-Created: 2025-11-02 19:46:15 
-Author: electricwolfemarshmallowhypertext
-"""
+"""Local Sentence Transformers embeddings with persistent Chroma/SQLite storage.
 
-import os
+No provider, Firebase or cloud service is required. Model files must already be
+present unless the caller explicitly opts into a model download. Existing stores
+without a matching model contract are rejected, never silently re-embedded/reset.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import version
+import json
 from pathlib import Path
 import shutil
-import logging
-from typing import Optional, Dict, List, Any
+import sqlite3
+import tempfile
+from typing import Any
+
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-import sqlite3
-from datetime import datetime, timedelta
-import json
-import zstandard as zstd
-import xxhash
-from sentence_transformers import SentenceTransformer
 import numpy as np
-from prometheus_client import Counter, Histogram, Gauge
+from prometheus_client import Counter, Gauge, Histogram
+from sentence_transformers import SentenceTransformer
 import structlog
-from ..exceptions import MemoryException
+import torch
+import zstandard as zstd
 
-# Configure logging
+from .embedding_contract import validate_vector
+from .exceptions import MemoryException
+
 logger = structlog.get_logger("sticky.memory.engine")
+MEMORY_SIZE = Gauge("sticky_memory_size_bytes", "Memory store size in bytes", ["store"])
+MEMORY_OPS = Counter("sticky_memory_operations_total", "Memory operations count", ["operation"])
+MEMORY_OP_DURATION = Histogram("sticky_memory_operation_duration_seconds", "Memory operation duration")
+EMBEDDING_DURATION = Histogram("sticky_embedding_generation_duration_seconds", "Embedding generation duration")
+CACHE_HITS = Counter("sticky_memory_cache_hits_total", "Memory cache hit count")
 
-# Metrics
-MEMORY_SIZE = Gauge(
-    "sticky_memory_size_bytes",
-    "Memory store size in bytes",
-    ["store"]
-)
-MEMORY_OPS = Counter(
-    "sticky_memory_operations_total",
-    "Memory operations count",
-    ["operation"]
-)
-MEMORY_OP_DURATION = Histogram(
-    "sticky_memory_operation_duration_seconds",
-    "Memory operation duration"
-)
-EMBEDDING_DURATION = Histogram(
-    "sticky_embedding_generation_duration_seconds",
-    "Embedding generation duration"
-)
-CACHE_HITS = Counter(
-    "sticky_memory_cache_hits_total",
-    "Memory cache hit count"
-)
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _loaded_model_fingerprint(model: SentenceTransformer) -> str:
+    """Bind actual loaded parameters and tokenizer/pooling semantics, not a label."""
+    modules = []
+    for name, module in model.named_children():
+        config = dict(module.get_config_dict()) if hasattr(module, "get_config_dict") else {}
+        if hasattr(module, "auto_model"):
+            transformer = module.auto_model.config.to_dict()
+            for incidental in ("_name_or_path", "transformers_version"):
+                transformer.pop(incidental, None)
+            config["transformer"] = transformer
+        modules.append({"name": name, "type": f"{type(module).__module__}.{type(module).__name__}", "config": config})
+    tokenizer = model.tokenizer
+    tokenizer_state = (tokenizer.backend_tokenizer.to_str() if hasattr(tokenizer, "backend_tokenizer")
+                       else {"vocab": tokenizer.get_vocab(), "special_tokens": tokenizer.special_tokens_map})
+    semantic_config = {"modules": modules, "tokenizer": tokenizer_state, "normalize_embeddings": True,
+                       "prompts": getattr(model, "prompts", {}),
+                       "default_prompt_name": getattr(model, "default_prompt_name", None),
+                       "truncate_dim": getattr(model, "truncate_dim", None),
+                       "dimension": model.get_embedding_dimension(),
+                       "libraries": {name: version(name) for name in ("sentence-transformers", "transformers", "torch")}}
+    digest = hashlib.sha256(json.dumps(semantic_config, sort_keys=True, separators=(",", ":"), default=str).encode())
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(json.dumps([name, str(tensor.dtype), list(tensor.shape)], separators=(",", ":")).encode())
+        digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
 
 class MemoryEngine:
-    """Memory engine with vector storage and persistence"""
-    
+    """Single-writer local vector store; synchronous model work inside async API."""
+
     def __init__(
         self,
         persist_dir: str = "memory_store",
-        sqlite_fallback_path: str = "memory_store/fallback.db",
+        sqlite_fallback_path: str | None = None,
         max_size_mb: int = 5,
-        backup_dir: str = "memory_store/backups",
+        backup_dir: str | None = None,
         env: str = "production",
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         embedding_cache_size: int = 1000,
-        embedding_batch_size: int = 32
+        embedding_batch_size: int = 32,
+        embedding_revision: str | None = None,
+        embedding_model_id: str | None = None,
+        local_files_only: bool = True,
     ):
-        self.persist_dir = Path(persist_dir)
-        self.sqlite_path = Path(sqlite_fallback_path)
-        self.backup_dir = Path(backup_dir)
+        self.persist_dir = Path(persist_dir).resolve()
+        self.sqlite_path = Path(sqlite_fallback_path).resolve() if sqlite_fallback_path else self.persist_dir / "fallback.db"
+        self.backup_dir = Path(backup_dir).resolve() if backup_dir else self.persist_dir.with_name(self.persist_dir.name + "-backups")
+        if (self.backup_dir == self.persist_dir or self.persist_dir in self.backup_dir.parents
+            or self.backup_dir in self.persist_dir.parents or self.sqlite_path == self.backup_dir
+            or self.backup_dir in self.sqlite_path.parents or self.sqlite_path in self.backup_dir.parents):
+            raise ValueError("Backup directory must not overlap live Chroma or SQLite storage")
+        if max_size_mb <= 0 or embedding_cache_size < 0 or embedding_batch_size <= 0:
+            raise ValueError("Invalid storage/cache/batch limits")
         self.max_size_bytes = max_size_mb * 1024 * 1024
         self.env = env
-        
-        # Create directories
-        self.persist_dir.mkdir(exist_ok=True, parents=True)
-        self.backup_dir.mkdir(exist_ok=True, parents=True)
-        self.sqlite_path.parent.mkdir(exist_ok=True, parents=True)
-        
-        # Initialize components
         self.client = None
-        self.sqlite_conn = None
-        self.embedding_model = SentenceTransformer(embedding_model)
-        self.embedding_cache = {}
+        self.collections: dict[str, Any] = {}
+        self.sqlite_conn: sqlite3.Connection | None = None
+        self.initialized = False
+        self.storage_degraded = False
+        self.embedding_model = SentenceTransformer(
+            embedding_model, revision=embedding_revision, device="cpu",
+            trust_remote_code=False, local_files_only=local_files_only,
+            model_kwargs={"use_safetensors": True},
+        )
+        dimension = self.embedding_model.get_embedding_dimension()
+        if not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError("Loaded model has no fixed embedding dimension")
+        self.embedding_dimension = dimension
+        self.embedding_identity = embedding_model_id or f"{embedding_model}@{embedding_revision or 'local'}"
+        self.embedding_fingerprint = _loaded_model_fingerprint(self.embedding_model)
+        self.embedding_cache: dict[str, list[float]] = {}
         self.embedding_cache_size = embedding_cache_size
         self.embedding_batch_size = embedding_batch_size
-        
-        # Initialize compression
         self.compressor = zstd.ZstdCompressor(level=3)
-        
-        # Track initialization
-        self.initialized = False
-        
+
+    @property
+    def _contract(self) -> dict[str, Any]:
+        return {"embedding_dimension": self.embedding_dimension, "embedding_model": self.embedding_identity,
+                "embedding_fingerprint": self.embedding_fingerprint}
+
     async def initialize(self) -> None:
-        """Initialize vector store with fallback and monitoring"""
+        if self.initialized:
+            return
         try:
-            # Setup embedding function
-            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
+            self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+            self.client = chromadb.PersistentClient(
+                path=str(self.persist_dir),
+                settings=Settings(anonymized_telemetry=False, allow_reset=False),
             )
-            
-            # Initialize Chroma
-            self.client = chromadb.Client(Settings(
-                persist_directory=str(self.persist_dir),
-                chroma_db_impl="duckdb+parquet",
-                anonymized_telemetry=False,
-                allow_reset=self.env == "development"
-            ))
-            
-            # Setup collections with proper schemas
-            await self._setup_collections(sentence_transformer_ef)
-            
-            # Initialize SQLite fallback
+            await self._setup_collections()
             await self._setup_sqlite_fallback()
-            
-            # Verify size limits
             await self._check_storage_limits()
-            
-            # Initial backup
             await self._create_backup()
-            
             self.initialized = True
-            
-        except Exception as e:
-            logger.error("Failed to initialize memory engine", error=str(e))
-            raise MemoryException("Memory initialization failed") from e
-            
-    async def _setup_collections(self, embedding_fn: Any) -> None:
-        """Setup required collections with proper configuration"""
-        collections = {
-            "user_memories": {
-                "metadata": {"hnsw:space": "cosine", "hnsw:M": 16},
-                "embedding_function": embedding_fn
-            },
-            "persona_contexts": {
-                "metadata": {"hnsw:space": "cosine", "hnsw:M": 8},
-                "embedding_function": embedding_fn
-            }
-        }
-        
-        for name, config in collections.items():
-            try:
-                self.client.create_collection(
-                    name=name,
-                    metadata=config["metadata"],
-                    embedding_function=config["embedding_function"]
-                )
-            except ValueError: # Collection exists
-                continue
-                
+        except Exception as error:
+            self.cleanup()
+            raise MemoryException("Memory initialization failed; inspect store/model compatibility") from error
+
+    async def _setup_collections(self) -> None:
+        existing = {collection.name for collection in self.client.list_collections()}
+        for name, connections in (("user_memories", 16), ("persona_contexts", 8)):
+            metadata = {"hnsw:space": "cosine", "hnsw:M": connections, **self._contract}
+            if name in existing:
+                collection = self.client.get_collection(name, embedding_function=None)
+                current = collection.metadata or {}
+                if any(current.get(key) != value for key, value in self._contract.items()):
+                    # Even an empty existing store needs an explicit migration if it
+                    # declares another model. Never overwrite model identity silently.
+                    if collection.count() or any(key in current for key in self._contract):
+                        raise ValueError("Existing collection model/dimension mismatch; migrate a copy explicitly")
+                    collection.modify(metadata=metadata)
+            else:
+                collection = self.client.create_collection(name, metadata=metadata, embedding_function=None)
+            self.collections[name] = collection
+
     async def _setup_sqlite_fallback(self) -> None:
-        """Initialize SQLite fallback database"""
         self.sqlite_conn = sqlite3.connect(self.sqlite_path)
-        cursor = self.sqlite_conn.cursor()
-        
-        # Create tables for fallback storage
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            persona_id TEXT,
-            content TEXT,
-            embedding BLOB,
-            created_at TIMESTAMP,
-            metadata TEXT
-        )
-        """)
-        
-        cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_user_persona 
-        ON memories(user_id, persona_id)
-        """)
-        
+        tables = {row[0] for row in self.sqlite_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "memories" in tables and "engine_metadata" not in tables:
+            if self.sqlite_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]:
+                raise ValueError("Existing fallback data has no model contract; migrate a copy explicitly")
+        self.sqlite_conn.execute("CREATE TABLE IF NOT EXISTS engine_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        expected = json.dumps(self._contract, sort_keys=True)
+        row = self.sqlite_conn.execute("SELECT value FROM engine_metadata WHERE key='embedding_contract'").fetchone()
+        if row and row[0] != expected:
+            raise ValueError("SQLite embedding model/dimension mismatch")
+        if not row and "memories" in tables and self.sqlite_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]:
+            raise ValueError("Existing fallback data has no model contract; migrate a copy explicitly")
+        self.sqlite_conn.execute("INSERT OR IGNORE INTO engine_metadata VALUES ('embedding_contract', ?)", (expected,))
+        self.sqlite_conn.execute("""CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY, user_id TEXT, persona_id TEXT, content BLOB,
+            embedding BLOB, created_at TEXT, metadata TEXT)""")
+        self.sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_user_persona ON memories(user_id, persona_id)")
         self.sqlite_conn.commit()
-        
-    async def build_context(
-        self,
-        user_id: str,
-        thread_id: str,
-        persona_id: str,
-        query: str,
-        include_memory: bool = True,
-        top_k: int = 3
-    ) -> Dict:
-        """Build conversation context with vector similarity search"""
+
+    def _require_initialized(self) -> None:
+        if not self.initialized or self.sqlite_conn is None:
+            raise MemoryException("Memory engine is not initialized")
+
+    async def _get_embedding(self, text: str) -> list[float]:
+        if not isinstance(text, str) or not text.strip():
+            raise MemoryException("Embedding input must be nonempty text")
+        key = hashlib.sha256(text.encode()).hexdigest()
+        if key in self.embedding_cache:
+            CACHE_HITS.inc()
+            return list(self.embedding_cache[key])
         try:
-            # Get session messages
-            session = await self.load_session(user_id, thread_id)
-            
-            memories = []
-            if include_memory:
-                # Get query embedding
-                query_embedding = await self._get_embedding(query)
-                
-                # Search vector store
-                with MEMORY_OP_DURATION.time():
-                    results = self.client.collection("user_memories").query(
-                        query_embeddings=[query_embedding],
-                        where={
-                            "$and": [
-                                {"user_id": user_id},
-                                {"persona_id": persona_id}
-                            ]
-                        },
-                        n_results=top_k
-                    )
-                    MEMORY_OPS.labels("search").inc()
-                
-                memories = [
-                    json.loads(meta["memory"])
-                    for meta in results["metadatas"][0]
-                ]
-                
-            return {
-                "messages": session["messages"],
-                "memory": self._format_memories(memories)
-            }
-            
-        except Exception as e:
-            logger.error("Failed to build context", error=str(e))
-            raise MemoryException("Context building failed") from e
-            
-    async def transfer_context(
-        self,
-        user_id: str,
-        from_persona: str,
-        to_persona: str,
-        query: str
-    ) -> List[Dict]:
-        """Transfer relevant memories between personas"""
-        try:
-            # Get query embedding
-            query_embedding = await self._get_embedding(query)
-            
-            # Search source persona memories
-            with MEMORY_OP_DURATION.time():
-                results = self.client.collection("user_memories").query(
-                    query_embeddings=[query_embedding],
-                    where={
-                        "$and": [
-                            {"user_id": user_id},
-                            {"persona_id": from_persona}
-                        ]
-                    },
-                    n_results=5
-                )
-                MEMORY_OPS.labels("search").inc()
-            
-            # Transfer relevant memories
-            transferred = []
-            for i, memory in enumerate(results["metadatas"][0]):
-                memory_data = json.loads(memory["memory"])
-                embedding = results["embeddings"][0][i]
-                
-                # Store for new persona
-                event = await self.store_memory(
-                    user_id=user_id,
-                    thread_id=memory_data["thread_id"],
-                    persona_id=to_persona,
-                    text=memory_data["text"],
-                    type="transferred",
-                    salience=memory_data["salience"],
-                    embedding=embedding
-                )
-                
-                transferred.append(event)
-                
-            return transferred
-            
-        except Exception as e:
-            logger.error("Failed to transfer context", error=str(e))
-            raise MemoryException("Context transfer failed") from e
-            
-    async def store_memory(
-        self,
-        user_id: str,
-        thread_id: str,
-        persona_id: str,
-        text: str,
-        type: str,
-        salience: float,
-        embedding: Optional[List[float]] = None
-    ) -> Dict:
-        """Store vectorized memory with compression"""
-        try:
-            # Validate inputs
-            if not user_id or not thread_id or not text:
-                raise ValueError("Missing required fields")
-                
-            # Generate memory ID
-            memory_id = xxhash.xxh64(
-                f"{user_id}:{thread_id}:{text}".encode()
-            ).hexdigest()
-            
-            # Get embedding if not provided
-            if embedding is None:
-                embedding = await self._get_embedding(text)
-                
-            # Validate embedding
-            if len(embedding) != 1024:
-                raise ValueError("Invalid embedding dimension")
-                
-            # Create memory event
-            event = {
-                "id": memory_id,
-                "text": text,
-                "type": type,
-                "salience": salience,
-                "created_at": datetime.utcnow().isoformat(),
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "persona_id": persona_id
-            }
-            
-            # Compress text
-            compressed_text = self.compressor.compress(text.encode())
-            
-            try:
-                # Store in vector database
-                with MEMORY_OP_DURATION.time():
-                    self.client.collection("user_memories").add(
-                        ids=[memory_id],
-                        embeddings=[embedding],
-                        metadatas=[{
-                            "user_id": user_id,
-                            "persona_id": persona_id,
-                            "memory": json.dumps(event)
-                        }],
-                        documents=[compressed_text]
-                    )
-                    MEMORY_OPS.labels("store").inc()
-                    
-            except Exception as e:
-                # Fallback to SQLite
-                logger.warning("Vector store failed, using SQLite fallback", error=str(e))
-                cursor = self.sqlite_conn.cursor()
-                cursor.execute("""
-                INSERT INTO memories (id, user_id, persona_id, content, embedding, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    memory_id,
-                    user_id,
-                    persona_id,
-                    compressed_text,
-                    np.array(embedding).tobytes(),
-                    event["created_at"],
-                    json.dumps(event)
-                ))
-                self.sqlite_conn.commit()
-                
-            # Check size limits
-            await self._check_storage_limits()
-            
-            return event
-            
-        except Exception as e:
-            logger.error("Failed to store memory", error=str(e))
-            raise MemoryException("Memory storage failed") from e
-            
-    async def load_session(
-        self,
-        user_id: str,
-        thread_id: str
-    ) -> Dict:
-        """Load conversation session"""
-        try:
-            if not user_id or not thread_id:
-                raise ValueError("Missing user_id or thread_id")
-                
-            with MEMORY_OP_DURATION.time():
-                collection = self.client.collection("user_memories")
-                results = collection.get(
-                    where={
-                        "$and": [
-                            {"user_id": user_id},
-                            {"thread_id": thread_id}
-                        ]
-                    },
-                    limit=100
-                )
-                MEMORY_OPS.labels("retrieve").inc()
-                
-            if not results["ids"]:
-                return {
-                    "thread_id": thread_id,
-                    "user_id": user_id,
-                    "messages": [],
-                    "created_at": datetime.utcnow().isoformat()
-                }
-                
-            # Sort by timestamp
-            memories = []
-            for meta in results["metadatas"]:
-                memory = json.loads(meta["memory"])
-                memories.append(memory)
-                
-            memories.sort(key=lambda x: x["created_at"])
-            
-            return {
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "messages": memories,
-                "created_at": memories[0]["created_at"]
-            }
-            
-        except Exception as e:
-            logger.error("Failed to load session", error=str(e))
-            raise MemoryException("Session loading failed") from e
-            
-    async def _get_embedding(self, text: str) -> List[float]:
-        """Generate vector embedding with caching"""
-        try:
-            if not text:
-                raise ValueError("Empty text")
-                
-            # Check cache
-            cache_key = xxhash.xxh64(text.encode()).hexdigest()
-            if cache_key in self.embedding_cache:
-                CACHE_HITS.inc()
-                return self.embedding_cache[cache_key]
-                
-            # Generate embedding
             with EMBEDDING_DURATION.time():
-                embedding = self.embedding_model.encode(
-                    text,
-                    batch_size=self.embedding_batch_size
-                ).tolist()
-                
-            # Update cache
-            self.embedding_cache[cache_key] = embedding
-            if len(self.embedding_cache) > self.embedding_cache_size:
-                # Remove oldest entry
-                self.embedding_cache.pop(next(iter(self.embedding_cache)))
-                
-            return embedding
-            
-        except Exception as e:
-            logger.error("Failed to generate embedding", error=str(e))
-            raise MemoryException("Embedding generation failed") from e
-            
-    async def _check_storage_limits(self) -> None:
-        """Verify and enforce storage limits"""
-        total_size = 0
-        
-        # Check Chroma size
-        for path in self.persist_dir.rglob('*'):
-            if path.is_file():
-                total_size += path.stat().st_size
-                
-        # Check SQLite size
-        if self.sqlite_path.exists():
-            total_size += self.sqlite_path.stat().st_size
-            
-        # Update metrics
-        MEMORY_SIZE.labels("total").set(total_size)
-        
-        if total_size > self.max_size_bytes:
-            logger.warning(
-                "Storage size exceeds limit",
-                current_size=total_size,
-                limit=self.max_size_bytes
-            )
-            await self._cleanup_old_data()
-            
-    async def _cleanup_old_data(self) -> None:
-        """Remove oldest data to maintain size limits"""
-        try:
-            # Get all collections
-            for collection in self.client.list_collections():
-                # Get count and sort by timestamp
-                results = collection.get(
-                    limit=1000,
-                    where={},
-                    include=["metadatas"]
+                vector = self.embedding_model.encode(
+                    text, batch_size=self.embedding_batch_size, convert_to_numpy=True,
+                    normalize_embeddings=True, show_progress_bar=False,
                 )
-                
-                if results["ids"]:
-                    # Sort by timestamp and remove oldest
-                    sorted_results = sorted(
-                        zip(results["ids"], results["metadatas"]),
-                        key=lambda x: json.loads(x[1]["memory"])["created_at"]
+            result = validate_vector(vector.tolist(), self.embedding_dimension)
+            if self.embedding_cache_size:
+                self.embedding_cache[key] = result
+                while len(self.embedding_cache) > self.embedding_cache_size:
+                    self.embedding_cache.pop(next(iter(self.embedding_cache)))
+            return list(result)
+        except Exception as error:
+            raise MemoryException("Embedding generation failed") from error
+
+    async def store_memory(self, user_id: str, thread_id: str, persona_id: str, text: str,
+                           type: str, salience: float, embedding: list[float] | None = None) -> dict:
+        self._require_initialized()
+        try:
+            if not all(isinstance(value, str) and value.strip() for value in (user_id, thread_id, persona_id, text, type)):
+                raise ValueError("Missing required fields")
+            if len(text) > 4096 or not np.isfinite(salience) or not 0 <= salience <= 1:
+                raise ValueError("Invalid text size or salience")
+            vector = validate_vector(embedding if embedding is not None else await self._get_embedding(text), self.embedding_dimension)
+            material = json.dumps([user_id, thread_id, persona_id, text], separators=(",", ":")).encode()
+            memory_id = hashlib.sha256(material).hexdigest()
+            event = {"id": memory_id, "text": text, "type": type, "salience": salience,
+                     "created_at": _now(), "thread_id": thread_id, "user_id": user_id, "persona_id": persona_id}
+            await self._check_storage_limits(additional_bytes=len(text.encode()) + len(vector) * 4 + len(json.dumps(event).encode()))
+            try:
+                with MEMORY_OP_DURATION.time():
+                    self.collections["user_memories"].upsert(
+                        ids=[memory_id], embeddings=[vector], documents=[text],
+                        metadatas=[{"user_id": user_id, "thread_id": thread_id, "persona_id": persona_id,
+                                    "memory": json.dumps(event)}],
                     )
-                    
-                    # Remove oldest 20%
-                    to_remove = sorted_results[:len(sorted_results)//5]
-                    collection.delete(ids=[id for id, _ in to_remove])
-                    
-            # Vacuum SQLite
-            if self.sqlite_conn:
-                self.sqlite_conn.execute("VACUUM")
-                
-        except Exception as e:
-            logger.error("Failed to cleanup old data", error=str(e))
-            
-    async def _create_backup(self) -> None:
-        """Create timestamped backup"""
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        backup_path = self.backup_dir / f"memory_store_{timestamp}"
-        
+                self.sqlite_conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+                self.sqlite_conn.commit()
+                backend = "chroma"
+            except Exception as error:
+                self.storage_degraded = True
+                logger.warning("Vector write failed; persisting queryable SQLite fallback", error_type=type_name(error))
+                self.sqlite_conn.execute("""INSERT OR REPLACE INTO memories
+                    (id,user_id,persona_id,content,embedding,created_at,metadata) VALUES (?,?,?,?,?,?,?)""",
+                    (memory_id, user_id, persona_id, self.compressor.compress(text.encode()),
+                     np.asarray(vector, dtype=np.float32).tobytes(), event["created_at"], json.dumps(event)))
+                self.sqlite_conn.commit()
+                backend = "sqlite"
+            MEMORY_OPS.labels("store").inc()
+            return {**event, "storage_backend": backend}
+        except Exception as error:
+            raise MemoryException("Memory storage failed") from error
+
+    def _fallback_rows(self, user_id: str, persona_id: str | None = None) -> list[tuple[dict, list[float]]]:
+        sql, params = "SELECT metadata,embedding FROM memories WHERE user_id=?", [user_id]
+        if persona_id is not None:
+            sql += " AND persona_id=?"
+            params.append(persona_id)
+        return [(json.loads(meta), validate_vector(np.frombuffer(vector, dtype=np.float32).tolist(), self.embedding_dimension))
+                for meta, vector in self.sqlite_conn.execute(sql, params)]
+
+    async def load_session(self, user_id: str, thread_id: str) -> dict:
+        self._require_initialized()
+        if not user_id or not thread_id:
+            raise MemoryException("Missing user_id or thread_id")
+        memories: dict[str, dict] = {}
         try:
-            # Backup Chroma
-            shutil.copytree(self.persist_dir, backup_path)
-            
-            # Backup SQLite
-            if self.sqlite_path.exists():
-                shutil.copy2(
-                    self.sqlite_path,
-                    backup_path / "fallback.db"
-                )
-                
-            # Cleanup old backups (keep last 5)
-            backups = sorted(self.backup_dir.glob("memory_store_*"))
-            for backup in backups[:-5]:
-                shutil.rmtree(backup)
-                
-        except Exception as e:
-            logger.error("Failed to create backup", error=str(e))
-            
+            records = self.collections["user_memories"].get(
+                where={"$and": [{"user_id": user_id}, {"thread_id": thread_id}]}, include=["metadatas"])
+            for meta in records["metadatas"] or []:
+                event = json.loads(meta["memory"])
+                memories[event["id"]] = event
+        except Exception as error:
+            self.storage_degraded = True
+            logger.warning("Vector read failed; returning available SQLite fallback", error_type=type_name(error))
+        for event, _ in self._fallback_rows(user_id):
+            if event["thread_id"] == thread_id:
+                memories[event["id"]] = event
+        ordered = sorted(memories.values(), key=lambda event: (event["created_at"], event["id"]))
+        MEMORY_OPS.labels("retrieve").inc()
+        return {"thread_id": thread_id, "user_id": user_id, "messages": ordered,
+                "created_at": ordered[0]["created_at"] if ordered else _now(), "storage_degraded": self.storage_degraded}
+
+    async def _query(self, user_id: str, persona_id: str, query: str, top_k: int) -> list[tuple[dict, list[float]]]:
+        self._require_initialized()
+        if not user_id or not persona_id or not isinstance(top_k, int) or not 1 <= top_k <= 100:
+            raise MemoryException("Invalid query scope or top_k")
+        vector = await self._get_embedding(query)
+        candidates: dict[str, tuple[float, dict, list[float]]] = {}
+        try:
+            collection = self.collections["user_memories"]
+            if collection.count():
+                results = collection.query(query_embeddings=[vector],
+                    where={"$and": [{"user_id": user_id}, {"persona_id": persona_id}]},
+                    n_results=min(top_k, collection.count()), include=["metadatas", "embeddings", "distances"])
+                for meta, embedding, distance in zip(results["metadatas"][0], results["embeddings"][0], results["distances"][0]):
+                    event = json.loads(meta["memory"])
+                    candidates[event["id"]] = (float(distance), event, list(embedding))
+        except Exception as error:
+            self.storage_degraded = True
+            logger.warning("Vector search failed; querying SQLite fallback", error_type=type_name(error))
+        query_vector = np.asarray(vector)
+        for event, embedding in self._fallback_rows(user_id, persona_id):
+            stored = np.asarray(embedding)
+            norm = float(np.linalg.norm(query_vector) * np.linalg.norm(stored))
+            distance = 1 - float(np.dot(query_vector, stored)) / norm if norm else 1.0
+            candidates[event["id"]] = (distance, event, embedding)
+        MEMORY_OPS.labels("search").inc()
+        ordered = sorted(candidates.values(), key=lambda item: (item[0], item[1]["id"]))[:top_k]
+        return [(event, embedding) for _, event, embedding in ordered]
+
+    async def build_context(self, user_id: str, thread_id: str, persona_id: str, query: str,
+                            include_memory: bool = True, top_k: int = 3) -> dict:
+        session = await self.load_session(user_id, thread_id)
+        matches = await self._query(user_id, persona_id, query, top_k) if include_memory else []
+        return {"messages": session["messages"], "memory": self._format_memories([event for event, _ in matches]),
+                "storage_degraded": self.storage_degraded}
+
+    async def transfer_context(self, user_id: str, from_persona: str, to_persona: str, query: str) -> list[dict]:
+        if not to_persona or to_persona == from_persona:
+            raise MemoryException("Transfer requires different source and destination personas")
+        matches = await self._query(user_id, from_persona, query, 5)
+        return [await self.store_memory(user_id, event["thread_id"], to_persona, event["text"],
+                                       "transferred", event["salience"], embedding)
+                for event, embedding in matches]
+
+    async def _check_storage_limits(self, additional_bytes: int = 0) -> None:
+        paths = {path.resolve() for path in self.persist_dir.rglob("*") if path.is_file()}
+        if self.sqlite_path.is_file():
+            paths.add(self.sqlite_path)
+        total = sum(path.stat().st_size for path in paths)
+        MEMORY_SIZE.labels("total").set(total)
+        if total + additional_bytes > self.max_size_bytes:
+            raise MemoryException("Memory size exceeds configured limit; archive data explicitly")
+
+    async def _cleanup_old_data(self) -> None:
+        """Explicit retention operation; never called by ordinary close or writes."""
+        self._require_initialized()
+        collection = self.collections["user_memories"]
+        records = collection.get(include=["metadatas"])
+        ordered = sorted(zip(records["ids"], records["metadatas"]), key=lambda item: json.loads(item[1]["memory"])["created_at"])
+        if ordered:
+            collection.delete(ids=[identifier for identifier, _ in ordered[:max(1, len(ordered) // 5)]])
+        count = self.sqlite_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        if count:
+            self.sqlite_conn.execute("DELETE FROM memories WHERE id IN (SELECT id FROM memories ORDER BY created_at LIMIT ?)", (max(1, count // 5),))
+            self.sqlite_conn.commit()
+            self.sqlite_conn.execute("VACUUM")
+
+    async def _create_backup(self) -> Path:
+        """Publish a complete snapshot of a quiescent single-writer store.
+
+        Failed copies are not published or counted by retention. The manifest
+        permits independent file-integrity checks; concurrent writes are unsupported.
+        """
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = self.backup_dir / ("memory_store_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S%f"))
+        with tempfile.TemporaryDirectory(prefix=".pending-", dir=self.backup_dir) as temporary:
+            staged = Path(temporary) / "snapshot"
+            shutil.copytree(self.persist_dir, staged)
+            if self.sqlite_conn is not None:
+                with sqlite3.connect(staged / "fallback.db") as destination:
+                    self.sqlite_conn.backup(destination)
+            hashes = {}
+            for path in sorted(staged.rglob("*")):
+                if path.is_file() and path.name != "backup-manifest.json":
+                    digest = hashlib.sha256()
+                    with path.open("rb") as source:
+                        for block in iter(lambda: source.read(65536), b""):
+                            digest.update(block)
+                    hashes[path.relative_to(staged).as_posix()] = digest.hexdigest()
+            (staged / "backup-manifest.json").write_text(json.dumps(
+                {"complete": True, "created_at": _now(), "model_contract": self._contract, "file_hashes": hashes},
+                sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            staged.replace(backup)
+        completed = [path for path in sorted(self.backup_dir.glob("memory_store_*"))
+                     if path.is_dir() and (path / "backup-manifest.json").is_file()]
+        for old in completed[:-5]:
+            shutil.rmtree(old)
+        return backup
+
     def cleanup(self) -> None:
-        """Cleanup connections and resources"""
-        try:
-            if self.sqlite_conn:
-                self.sqlite_conn.close()
-                
-            if self.client:
-                self.client.reset()
-                
-            # Clear embedding cache
-            self.embedding_cache.clear()
-                
-        except Exception as e:
-            logger.error("Failed to cleanup", error=str(e))
-            
-    def _format_memories(self, memories: List[Dict]) -> List[str]:
-        """Format memories for context"""
-        return [f"- {m['text']}" for m in memories]
+        """Close this instance without resetting/deleting persisted user data."""
+        if self.sqlite_conn is not None:
+            self.sqlite_conn.close()
+            self.sqlite_conn = None
+        self.collections.clear()
+        self.client = None  # Chroma owns native handle lifecycle; persistence is automatic.
+        self.embedding_cache.clear()
+        self.initialized = False
+
+    @staticmethod
+    def _format_memories(memories: list[dict]) -> list[str]:
+        return [f"- {memory['text']}" for memory in memories]
+
+
+def type_name(error: Exception) -> str:
+    return error.__class__.__name__

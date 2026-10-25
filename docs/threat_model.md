@@ -56,10 +56,10 @@ timeouts, vulnerability auditing, and repository indicator scanning.
 | Markdown/HTML injection | untrusted packet text is escaped in Markdown output |
 | Trust-score replay | source hash and run ID observations are deduplicated |
 | Receipt-history modification | receipt hash verification and previous-hash chaining |
-| Self-asserted skill score | accepted edits require a bound validation receipt |
 | Identity record tampering | Ed25519 signatures, state hashes, and receipt-hash chaining |
 | Identity substitution during import | required operator-pinned signer fingerprint |
 | Identity history rewind | append-only versions and import prefix validation |
+| Self-asserted skill score | accepted edits require a bound external validation receipt, not proof of evaluator honesty |
 | CI dependency substitution | exact Action SHAs and hash-locked Python packages |
 | Executable model/data formats | unsupported; AgentMD accepts JSON/JSONL artifacts only |
 
@@ -99,12 +99,12 @@ Primary sources:
 - Lead, context, and skill receipts are not asymmetrically signed.
 - Identity signatures prove control of the trusted private key, not that a
   human personally authored or approved the identity content.
-- No sandboxed adapter execution because adapters are not executed in v0.x.
+- No asymmetric signatures for execution receipts or external evaluators yet.
+- No sandboxed execution: explicit local commands run with caller privileges and inherited environment. Tool-specific provider integration is not implied.
 - No guarantee against a malicious actor who controls both the workspace and
   the external identity signing key.
 - No production SaaS security claim.
-- No runtime egress sandbox; AgentMD v0.x does not execute adapters, and CI
-  network policy remains a repository/runner control.
+- No runtime egress sandbox; caller-specified commands can access networks according to the caller environment. CI network policy remains a repository/runner control.
 
 ## Required human gates
 

@@ -53,3 +53,9 @@ Expected:
 - printed `deterministic_hash`
 
 To check deterministic repeat match, run the demo script twice without changing inputs and compare the printed deterministic hash values.
+
+## Timestamp and warning semantics
+
+Artifact timestamps are validated by the CLI's built-in RFC3339 calendar/timezone parser, regardless of optional jsonschema format packages. Offsets are compared by UTC instant with exact fractional-second ordering; deterministic run/source tie-breakers apply to equal instants. Leap seconds are rejected because the runtime has no leap-second time scale. All packet validation warnings are finalized before the deterministic hash is computed. A zero-input discovery produces zero artifacts and null event proof, not a synthetic observation.
+
+Loop statuses `closed`, `completed`, `done`, `resolved`, `cancelled`, and `canceled` (case-insensitive) are terminal. They remain visible as history but are not suggested for closure. Other status strings are conservatively actionable for compatibility.

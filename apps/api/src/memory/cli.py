@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn
 from .memory_engine import MemoryEngine
-from ..exceptions import MemoryException
+from .exceptions import MemoryException
 
 # Configure logging
 logger = structlog.get_logger("sticky.memory.cli")

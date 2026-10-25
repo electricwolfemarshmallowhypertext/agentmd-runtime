@@ -8,6 +8,8 @@ import json
 from datetime import datetime
 import xxhash
 import structlog
+from uuid import uuid4
+from .embedding_contract import DEFAULT_EMBEDDING_DIMENSION, MAX_EMBEDDING_DIMENSION, validate_vector
 
 from .models import MemoryType, MemoryState, MemoryMetadata  # re-exported enums/model
 
@@ -15,7 +17,7 @@ logger = structlog.get_logger("memory.validation")
 
 
 class MemoryEvent(BaseModel):
-    id: str
+    id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
     text: str = Field(..., min_length=1, max_length=4096)
     type: MemoryType
     salience: float = Field(..., ge=0.0, le=1.0)
@@ -23,30 +25,17 @@ class MemoryEvent(BaseModel):
     thread_id: str
     user_id: str
     persona_id: str
+    embedding_dimension: int = Field(DEFAULT_EMBEDDING_DIMENSION, gt=0, le=MAX_EMBEDDING_DIMENSION)
     embedding: Optional[List[float]] = None
     metadata: MemoryMetadata = Field(default_factory=MemoryMetadata)
 
-    @validator("id", pre=True, always=True)
-    def generate_id(cls, v: Optional[str], values: Dict[str, Any]) -> str:
-        if v:
-            return v
-        text = values.get("text", "")
-        thread_id = values.get("thread_id", "")
-        user_id = values.get("user_id", "")
-        return xxhash.xxh64(f"{user_id}:{thread_id}:{text}".encode()).hexdigest()
-
     @validator("embedding")
-    def validate_embedding(cls, v: Optional[List[float]]) -> Optional[List[float]]:
-        if v is not None:
-            if len(v) != 1024:
-                raise ValueError("Embedding must have 1024 dimensions")
-            if not all(isinstance(x, float) for x in v):
-                raise ValueError("Embedding must contain only floats")
-        return v
+    def validate_embedding(cls, v: Optional[List[float]], values: Dict[str, Any]) -> Optional[List[float]]:
+        return validate_vector(v, values.get("embedding_dimension", DEFAULT_EMBEDDING_DIMENSION)) if v is not None else None
 
     @validator("metadata")
     def validate_metadata(cls, v: MemoryMetadata) -> MemoryMetadata:
-        size = len(json.dumps(v.dict()).encode("utf-8"))
+        size = len(json.dumps(v.model_dump(mode="json")).encode("utf-8"))
         if size > 10 * 1024:
             raise ValueError("Metadata too large")
         return v
