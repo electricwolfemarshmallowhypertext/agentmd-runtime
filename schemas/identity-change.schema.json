@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmd.dev/schemas/identity-change.schema.json",
+  "title": "AgentMD Identity Change Proposal",
+  "type": "object",
+  "required": ["schema_version", "change_id", "agent_id", "from_version", "summary", "operations", "requested_by", "approved_by", "timestamp"],
+  "properties": {
+    "schema_version": {"const": "identity-change.v1"},
+    "change_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "agent_id": {"type": "string", "pattern": "^agentmd:[a-f0-9]{64}$"},
+    "from_version": {"type": "integer", "minimum": 1},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "operations": {
+      "type": "array", "minItems": 1, "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": ["op", "path"],
+        "properties": {
+          "op": {"type": "string", "enum": ["add", "replace", "remove"]},
+          "path": {
+            "type": "string",
+            "pattern": "^/(name|purpose|operating_principles|boundaries|working_style/[A-Za-z0-9_.-]{1,128}|user_preferences/[A-Za-z0-9_.-]{1,128})$"
+          },
+          "value": {
+            "oneOf": [
+              {"type": "string", "maxLength": 16384},
+              {"type": "array", "maxItems": 128, "items": {"type": "string", "minLength": 1, "maxLength": 8192}}
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "requested_by": {"type": ["string", "null"], "maxLength": 256},
+    "approved_by": {"type": ["string", "null"], "maxLength": 256},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 64}
+  },
+  "additionalProperties": false
+}

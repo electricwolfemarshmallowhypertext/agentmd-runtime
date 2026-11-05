@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import math
+import os
+import signal
+import threading
+import time
 import re
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import typer
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 app = typer.Typer(add_completion=False, help="AgentMD context governance runtime CLI")
 lead_app = typer.Typer(add_completion=False, help="AI Work Lead primitives")
 skill_app = typer.Typer(add_completion=False, help="Skill optimization gates")
+identity_app = typer.Typer(add_completion=False, help="Durable agent identity-state primitives")
 app.add_typer(lead_app, name="lead")
 app.add_typer(skill_app, name="skill")
+app.add_typer(identity_app, name="identity")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
@@ -56,15 +70,15 @@ STOPWORDS = {
     "context",
 }
 
-ADAPTER_INSTRUCTIONS = {
-    "codex": "codex --task \"{task}\" --context-file \"{context_file}\"",
-    "claude": "claude code --prompt \"{task}\" --context-file \"{context_file}\"",
-    "gemini": "gemini --prompt \"{task}\" --context-file \"{context_file}\"",
-}
 
 LEAD_ARTIFACT_SCHEMA_FILE = "schemas/lead-artifact.schema.json"
 SKILL_EDIT_SCHEMA_FILE = "schemas/skill-edit.schema.json"
 SKILL_VALIDATION_SCHEMA_FILE = "schemas/skill-validation.schema.json"
+IDENTITY_RECORD_SCHEMA_FILE = "schemas/agent-identity.schema.json"
+IDENTITY_CHANGE_SCHEMA_FILE = "schemas/identity-change.schema.json"
+IDENTITY_ENVELOPE_SCHEMA_FILE = "schemas/identity-envelope.schema.json"
+IDENTITY_MAX_FILE_BYTES = 10_485_760
+IDENTITY_KEY_MAX_BYTES = 65_536
 TRUST_WEIGHT_VERSION = "trust-weight.v1"
 TRUST_LOW_THRESHOLD = 0.5
 LEAD_MAX_ARTIFACT_BYTES = 1_048_576
@@ -116,6 +130,116 @@ def _atomic_write_text(path: Path, text: str) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def _atomic_write_bundle(root: Path, outputs: list[tuple[Path, str]]) -> None:
+    """Stage all outputs, then replace; roll back ordinary I/O failures.
+
+    This is not a filesystem transaction: concurrent writers and process/power
+    loss during replacement require external serialization/recovery.
+    """
+    staged: list[tuple[Path, Path, Path | None]] = []
+    replaced: list[tuple[Path, Path | None]] = []
+    recovery_backups: list[Path] = []
+    try:
+        # Validate every destination before creating directories or replacing files.
+        paths = [_require_path_within(p, root, "output_outside_workspace") for p, _ in outputs]
+        if len(set(paths)) != len(paths):
+            raise ValueError("output_bundle_duplicate_destination")
+        for path in paths:
+            if path.exists() and not path.is_file():
+                raise ValueError("output_destination_not_file")
+        for path, (_, content) in zip(paths, outputs):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            backup = None
+            with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".tmp") as tmp:
+                staged_path = Path(tmp.name)
+            staged.append((path, staged_path, backup))
+            staged_path.write_text(content, encoding="utf-8", newline="\n")
+            if path.exists():
+                with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".bak") as tmp:
+                    backup = Path(tmp.name)
+                staged[-1] = (path, staged_path, backup)
+                backup.write_bytes(path.read_bytes())
+        for path, staged_path, backup in staged:
+            _require_path_within(path, root, "output_outside_workspace")
+            staged_path.replace(path)
+            replaced.append((path, backup))
+    except (OSError, ValueError) as error:
+        rollback_failed = False
+        for path, backup in reversed(replaced):
+            try:
+                if backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    backup.replace(path)
+            except OSError:
+                rollback_failed = True
+                if backup is not None:
+                    recovery_backups.append(backup)
+        if rollback_failed:
+            paths = ", ".join(_display_path(root, path) for path in recovery_backups)
+            raise ValueError(f"output_bundle_rollback_failed: preserve recovery backups: {paths}") from error
+        raise ValueError("output_bundle_write_failed: prior output files preserved") from error
+    finally:
+        for _, staged_path, backup in staged:
+            staged_path.unlink(missing_ok=True)
+            if backup is not None and backup not in recovery_backups:
+                backup.unlink(missing_ok=True)
+
+
+def _timestamp_key(value: str) -> tuple[datetime, Decimal]:
+    """RFC3339 calendar timestamps, ordered by instant with exact fractional seconds.
+
+    Leap seconds are rejected (Python datetime has no leap-second time scale).
+    An empty timestamp is only for legacy context records with no event time.
+    """
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc), Decimal(0)
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})[Tt](\d{2}:\d{2}:\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})", value, flags=re.ASCII
+    )
+    if match is None:
+        raise ValueError("artifact_timestamp_invalid: expected RFC3339 date-time with timezone")
+    day, time, fraction, offset = match.groups()
+    # datetime accepts offsets like +01:60; RFC3339 does not.
+    if offset.upper() != "Z" and (int(offset[1:3]) > 23 or int(offset[4:6]) > 59):
+        raise ValueError("artifact_timestamp_invalid: invalid timezone offset")
+    try:
+        instant = datetime.fromisoformat(day + "T" + time + ("+00:00" if offset.upper() == "Z" else offset))
+        return instant.astimezone(timezone.utc), Decimal(fraction or "0")
+    except (ValueError, OverflowError) as error:
+        raise ValueError("artifact_timestamp_invalid: invalid calendar date-time") from error
+
+
+def _format_checker() -> Any:
+    jsonschema = _require_jsonschema()
+    checker = jsonschema.FormatChecker()
+
+    @checker.checks("date-time", raises=ValueError)
+    def date_time(value: Any) -> bool:
+        if not isinstance(value, str):
+            return True  # The schema type constraint reports non-strings.
+        if not value:
+            return False
+        _timestamp_key(value)
+        return True
+
+    return checker
+
+
+def _schema_error_summary(error: Any) -> str:
+    # Never include instance values or instance property names in diagnostics.
+    # Schema paths/required field names come from the bundled trusted schema.
+    location = "/".join(str(part) for part in error.absolute_schema_path)
+    if error.validator == "required":
+        missing = [key for key in error.validator_value if key not in error.instance]
+        detail = "missing required fields: " + ", ".join(missing)
+    elif error.validator == "additionalProperties":
+        detail = "Additional properties are not allowed"
+    else:
+        detail = "constraint failed: " + str(error.validator)
+    return f"schema/{location} ({detail})"
 
 
 def _require_path_within(path: Path, parent: Path, error_code: str) -> Path:
@@ -195,7 +319,7 @@ def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _load_config(root: Path) -> dict[str, Any]:
-    path = root / "agentmd.yaml"
+    path = _require_path_within(root / "agentmd.yaml", root, "config_outside_workspace")
     if not path.exists():
         return dict(DEFAULT_CONFIG)
     try:
@@ -277,13 +401,19 @@ def _check_jsonl(path: Path) -> tuple[bool, str]:
 
 
 def _discover_context_files(root: Path) -> dict[str, list[Path]]:
-    return {
+    for name in ("AGENTS.md", "skills", "memory", "policies", "evals", "receipts"):
+        _require_path_within(root / name, root, "context_root_outside_workspace")
+    files = {
         "agents": [root / "AGENTS.md"],
         "skills": sorted((root / "skills").glob("*/SKILL.md")),
         "memory": sorted((root / "memory").glob("*")),
         "policies": sorted((root / "policies").glob("*")),
         "evals": sorted((root / "evals").glob("*")),
     }
+    for paths in files.values():
+        for path in paths:
+            _require_path_within(path, root, "context_file_outside_workspace")
+    return files
 
 
 def validate_workspace(root: Path) -> dict[str, Any]:
@@ -638,6 +768,7 @@ def write_receipt(
     task: str | None = None,
     adapter: str | None = None,
     phase: str | None = None,
+    execution: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     validation = validate_workspace(root)
     resolved, resolved_path = _load_resolved(root)
@@ -690,6 +821,8 @@ def write_receipt(
             "warnings": [*validation["warnings"], *receipt_warnings],
         },
     }
+    if execution is not None:
+        receipt["execution"] = {**execution, "workspace_validation_ok": validation["ok"]}
     receipt_material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(receipt_material).hexdigest()
 
@@ -734,16 +867,9 @@ def _require_jsonschema() -> Any:
 
 def _validate_json_payload(payload: dict[str, Any], schema: dict[str, Any], error_prefix: str) -> list[str]:
     jsonschema = _require_jsonschema()
-    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
-    out: list[str] = []
-    for err in errors:
-        if err.path:
-            ptr = ".".join(str(part) for part in err.path)
-        else:
-            ptr = "$"
-        out.append(f"{error_prefix} at {ptr} ({err.message})")
-    return out
+    validator = jsonschema.Draft202012Validator(schema, format_checker=_format_checker())
+    errors = sorted(validator.iter_errors(payload), key=lambda e: str(list(e.absolute_schema_path)))
+    return [f"{error_prefix} at {_schema_error_summary(err)}" for err in errors]
 
 
 def _load_skill_edit_payload(root: Path, edit_path: Path) -> dict[str, Any]:
@@ -801,9 +927,10 @@ def _load_skill_validation_receipt(
     receipt_path = Path(receipt_path_raw)
     if receipt_path.is_absolute():
         raise ValueError("skill_validation_receipt_absolute_path_forbidden")
+    validation_root = _require_path_within(root / "evals" / "skill-validation", root, "skill_validation_root_outside_workspace")
     receipt_file = _require_path_within(
         root / receipt_path,
-        root / "evals" / "skill-validation",
+        validation_root,
         "skill_validation_receipt_outside_evals",
     )
     if receipt_file.suffix.lower() != ".json" or not receipt_file.is_file():
@@ -846,7 +973,8 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     skill_path = Path(skill_path_raw)
     if skill_path.is_absolute():
         raise ValueError("skill_edit_absolute_path_forbidden")
-    skill_file = _require_path_within(root / skill_path, root / "skills", "skill_edit_path_outside_skills")
+    skills_root = _require_path_within(root / "skills", root, "skill_root_outside_workspace")
+    skill_file = _require_path_within(root / skill_path, skills_root, "skill_edit_path_outside_skills")
     relative_skill_path = skill_file.relative_to((root / "skills").resolve())
     if len(relative_skill_path.parts) != 2 or relative_skill_path.name != "SKILL.md":
         raise ValueError("skill_edit_path_must_match: skills/<skill-name>/SKILL.md")
@@ -941,6 +1069,7 @@ def apply_skill_edit(root: Path, edit_path: Path) -> tuple[str, Path, dict[str, 
     return "rejected", rejection_path, base_record
 
 
+LEAD_TERMINAL_LOOP_STATUSES = {"closed", "completed", "done", "resolved", "cancelled", "canceled"}
 LEAD_VERIFIED_STATUSES = {"verified", "true", "confirmed", "pass", "passed"}
 LEAD_UNVERIFIED_STATUSES = {"unverified", "unknown", "pending", "needs_verification", "partial"}
 LEAD_CONTRADICTORY_STATUSES = {"contradicted", "false", "failed", "fail", "rejected"}
@@ -1007,8 +1136,9 @@ def _lead_check_json_depth(value: Any, source: str) -> None:
 def _lead_secret_findings(value: Any, path: str = "$") -> list[str]:
     findings: list[str] = []
     if isinstance(value, dict):
-        for key, item in value.items():
-            findings.extend(_lead_secret_findings(item, f"{path}.{key}"))
+        for index, (key, item) in enumerate(value.items()):
+            findings.extend(_lead_secret_findings(str(key), f"{path}[key:{index}]"))
+            findings.extend(_lead_secret_findings(item, f"{path}[value:{index}]"))
     elif isinstance(value, list):
         for index, item in enumerate(value):
             findings.extend(_lead_secret_findings(item, f"{path}[{index}]"))
@@ -1018,6 +1148,721 @@ def _lead_secret_findings(value: Any, path: str = "$") -> list[str]:
                 findings.append(f"{path}:{name}")
     return findings
 
+
+def _identity_canonical_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _identity_hash(payload: Any) -> str:
+    return hashlib.sha256(_identity_canonical_bytes(payload)).hexdigest()
+
+
+def _identity_state_dir(root: Path) -> Path:
+    return _require_path_within(root / ".agentmd" / "identity", root, "identity_state_outside_workspace")
+
+
+def _identity_records_dir(root: Path) -> Path:
+    return _require_path_within(_identity_state_dir(root) / "records", root, "identity_state_outside_workspace")
+
+
+@contextmanager
+def _identity_write_lock(root: Path):
+    state_dir = _identity_state_dir(root)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = _require_path_within(state_dir / ".write.lock", root, "identity_lock_outside_workspace")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as e:
+        raise ValueError("identity_write_locked: another identity mutation is active") from e
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
+def _identity_validate_schema(root: Path, payload: dict[str, Any], schema_file: str, prefix: str) -> None:
+    schema = _load_json_schema(root, schema_file, f"{prefix}_schema_missing")
+    errors = _validate_json_payload(payload, schema, f"{prefix}_schema_invalid")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def _identity_private_key(path: Path) -> Ed25519PrivateKey:
+    key_path = path.expanduser()
+    if key_path.is_symlink():
+        raise ValueError("identity_signing_key_symlink_not_allowed")
+    if not key_path.exists() or not key_path.is_file():
+        raise ValueError(f"identity_signing_key_missing: {key_path}")
+    if key_path.stat().st_size > IDENTITY_KEY_MAX_BYTES:
+        raise ValueError("identity_signing_key_too_large")
+    key_bytes = key_path.read_bytes()
+    key: Any = None
+    try:
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+    except (TypeError, ValueError):
+        try:
+            key = serialization.load_ssh_private_key(key_bytes, password=None)
+        except (TypeError, ValueError) as e:
+            raise ValueError("identity_signing_key_invalid_or_encrypted") from e
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError("identity_signing_key_must_be_ed25519")
+    return key
+
+
+def _identity_signer(private_key: Ed25519PrivateKey) -> dict[str, str]:
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    fingerprint_hex = hashlib.sha256(public_bytes).hexdigest()
+    return {
+        "algorithm": "ed25519",
+        "fingerprint": f"sha256:{fingerprint_hex}",
+        "public_key": base64.b64encode(public_bytes).decode("ascii"),
+    }
+
+
+def _identity_agent_id(signer: dict[str, str]) -> str:
+    return f"agentmd:{signer['fingerprint'].split(':', 1)[1]}"
+
+
+def _identity_sign_hash(private_key: Ed25519PrivateKey, digest_hex: str) -> str:
+    return base64.b64encode(private_key.sign(bytes.fromhex(digest_hex))).decode("ascii")
+
+
+def _identity_public_key(signer: dict[str, Any]) -> Ed25519PublicKey:
+    try:
+        public_bytes = base64.b64decode(str(signer.get("public_key") or ""), validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise ValueError("identity_public_key_invalid") from e
+    if len(public_bytes) != 32:
+        raise ValueError("identity_public_key_invalid")
+    fingerprint = f"sha256:{hashlib.sha256(public_bytes).hexdigest()}"
+    if fingerprint != signer.get("fingerprint"):
+        raise ValueError("identity_signer_fingerprint_mismatch")
+    try:
+        return Ed25519PublicKey.from_public_bytes(public_bytes)
+    except ValueError as e:
+        raise ValueError("identity_public_key_invalid") from e
+
+
+def _identity_verify_hash_signature(signer: dict[str, Any], digest_hex: str, signature: Any) -> None:
+    try:
+        signature_bytes = base64.b64decode(str(signature or ""), validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise ValueError("identity_signature_invalid_encoding") from e
+    try:
+        _identity_public_key(signer).verify(signature_bytes, bytes.fromhex(digest_hex))
+    except (InvalidSignature, ValueError) as e:
+        raise ValueError("identity_signature_verification_failed") from e
+
+
+def _identity_record_material(record: dict[str, Any]) -> dict[str, Any]:
+    material = dict(record)
+    material.pop("receipt_hash", None)
+    material.pop("signature", None)
+    return material
+
+
+def _identity_verify_record(root: Path, record: dict[str, Any]) -> None:
+    _identity_validate_schema(root, record, IDENTITY_RECORD_SCHEMA_FILE, "identity_record")
+    if _lead_secret_findings(record.get("state")):
+        raise ValueError("identity_record_secret_detected")
+    if _identity_hash(record.get("state")) != record.get("state_hash"):
+        raise ValueError("identity_state_hash_mismatch")
+    receipt_hash = _identity_hash(_identity_record_material(record))
+    if receipt_hash != record.get("receipt_hash"):
+        raise ValueError("identity_receipt_hash_mismatch")
+    signer = record.get("signer")
+    if not isinstance(signer, dict):
+        raise ValueError("identity_signer_invalid")
+    if _identity_agent_id(signer) != record.get("agent_id"):
+        raise ValueError("identity_agent_id_signer_mismatch")
+    _identity_verify_hash_signature(signer, receipt_hash, record.get("signature"))
+
+
+def _identity_verify_records(
+    root: Path,
+    records: list[dict[str, Any]],
+    expected_fingerprint: str | None = None,
+) -> list[dict[str, Any]]:
+    if not records:
+        raise ValueError("identity_not_initialized")
+    first_agent_id: str | None = None
+    first_fingerprint: str | None = None
+    previous: dict[str, Any] | None = None
+    for expected_version, record in enumerate(records, start=1):
+        _identity_verify_record(root, record)
+        signer = record["signer"]
+        if record["version"] != expected_version:
+            raise ValueError("identity_version_sequence_invalid")
+        if first_agent_id is None:
+            first_agent_id = str(record["agent_id"])
+            first_fingerprint = str(signer["fingerprint"])
+            if record["event"] != "init":
+                raise ValueError("identity_first_record_not_init")
+            if record["previous_state_hash"] is not None or record["previous_receipt_hash"] is not None:
+                raise ValueError("identity_first_record_has_previous_hash")
+        else:
+            assert previous is not None
+            if record["agent_id"] != first_agent_id or signer["fingerprint"] != first_fingerprint:
+                raise ValueError("identity_signer_changed")
+            if record["event"] == "init":
+                raise ValueError("identity_duplicate_init")
+            if record["previous_state_hash"] != previous["state_hash"]:
+                raise ValueError("identity_previous_state_hash_mismatch")
+            if record["previous_receipt_hash"] != previous["receipt_hash"]:
+                raise ValueError("identity_previous_receipt_hash_mismatch")
+        if record["event"] == "rollback" and record["target_version"] is None:
+            raise ValueError("identity_rollback_target_missing")
+        if record["event"] != "rollback" and record["target_version"] is not None:
+            raise ValueError("identity_target_version_unexpected")
+        previous = record
+    if expected_fingerprint is not None and first_fingerprint != expected_fingerprint:
+        raise ValueError("identity_signer_fingerprint_mismatch")
+    return records
+
+
+def _identity_load_record_file(root: Path, path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("identity_record_symlink_not_allowed")
+    path = _require_path_within(path, root, "identity_record_outside_workspace")
+    if path.stat().st_size > IDENTITY_MAX_FILE_BYTES:
+        raise ValueError(f"identity_record_too_large: {_display_path(root, path)}")
+    try:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"identity_record_invalid_json: {_display_path(root, path)}") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"identity_record_invalid_shape: {_display_path(root, path)}")
+    return payload
+
+
+def _identity_load_records(root: Path, expected_fingerprint: str | None = None) -> list[dict[str, Any]]:
+    records_dir = _identity_records_dir(root)
+    if not records_dir.exists():
+        return []
+    paths = sorted(records_dir.glob("*.json"))
+    records = [_identity_load_record_file(root, path) for path in paths]
+    if records:
+        _identity_verify_records(root, records, expected_fingerprint=expected_fingerprint)
+    return records
+
+
+def _identity_write_record(root: Path, record: dict[str, Any]) -> Path:
+    records_dir = _identity_records_dir(root)
+    records_dir.mkdir(parents=True, exist_ok=True)
+    path = _require_path_within(
+        records_dir / f"{int(record['version']):08d}.json",
+        root,
+        "identity_record_outside_workspace",
+    )
+    if path.exists():
+        raise ValueError(f"identity_version_already_exists: {record['version']}")
+    _atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _identity_build_record(
+    root: Path,
+    private_key: Ed25519PrivateKey,
+    state: dict[str, Any],
+    version: int,
+    event: str,
+    previous: dict[str, Any] | None,
+    summary: str,
+    change_id: str | None = None,
+    target_version: int | None = None,
+    requested_by: str | None = None,
+    approved_by: str | None = None,
+) -> dict[str, Any]:
+    signer = _identity_signer(private_key)
+    record: dict[str, Any] = {
+        "schema_version": "agent-identity.v1",
+        "agent_id": _identity_agent_id(signer),
+        "version": version,
+        "event": event,
+        "timestamp": _utc_now_iso(),
+        "state": state,
+        "state_hash": _identity_hash(state),
+        "previous_state_hash": previous.get("state_hash") if previous else None,
+        "previous_receipt_hash": previous.get("receipt_hash") if previous else None,
+        "change_id": change_id,
+        "summary": summary,
+        "target_version": target_version,
+        "requested_by": requested_by,
+        "approved_by": approved_by,
+        "signer": signer,
+    }
+    record["receipt_hash"] = _identity_hash(record)
+    record["signature"] = _identity_sign_hash(private_key, record["receipt_hash"])
+    _identity_verify_record(root, record)
+    return record
+
+
+def _identity_read_workspace_json(root: Path, path: Path, prefix: str) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"{prefix}_symlink_not_allowed")
+    path = _require_path_within(path, root, f"{prefix}_outside_workspace")
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"{prefix}_missing: {_display_path(root, path)}")
+    if path.stat().st_size > IDENTITY_MAX_FILE_BYTES:
+        raise ValueError(f"{prefix}_too_large")
+    try:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"{prefix}_invalid_json") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"{prefix}_invalid_shape")
+    if _lead_json_depth(payload) > LEAD_MAX_JSON_DEPTH:
+        raise ValueError(f"{prefix}_too_deep")
+    return payload
+
+
+def _identity_load_change(root: Path, path: Path) -> dict[str, Any]:
+    change = _identity_read_workspace_json(root, path, "identity_change")
+    _identity_validate_schema(root, change, IDENTITY_CHANGE_SCHEMA_FILE, "identity_change")
+    findings = _lead_secret_findings(change)
+    if findings:
+        raise ValueError("identity_change_secret_detected: " + ", ".join(sorted(findings)))
+    return change
+
+
+def _identity_apply_operations(state: dict[str, Any], operations: list[dict[str, Any]]) -> dict[str, Any]:
+    updated = json.loads(json.dumps(state))
+    seen_paths: set[str] = set()
+    for operation in operations:
+        op = str(operation.get("op"))
+        path = str(operation.get("path"))
+        if path in seen_paths:
+            raise ValueError(f"identity_change_duplicate_path: {path}")
+        seen_paths.add(path)
+        has_value = "value" in operation
+        if op in {"add", "replace"} and not has_value:
+            raise ValueError(f"identity_change_value_required: {path}")
+        if op == "remove" and has_value:
+            raise ValueError(f"identity_change_remove_value_forbidden: {path}")
+
+        if path in {"/name", "/purpose"}:
+            if op != "replace":
+                raise ValueError(f"identity_change_operation_not_allowed: {op} {path}")
+            value = operation["value"]
+            if not isinstance(value, str) or (path == "/name" and not value.strip()):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            updated[path[1:]] = value.strip() if path == "/name" else value
+            continue
+
+        if path in {"/operating_principles", "/boundaries"}:
+            if op != "replace":
+                raise ValueError(f"identity_change_operation_not_allowed: {op} {path}")
+            value = operation["value"]
+            if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            updated[path[1:]] = value
+            continue
+
+        parts = path.strip("/").split("/", 1)
+        if len(parts) != 2 or parts[0] not in {"working_style", "user_preferences"}:
+            raise ValueError(f"identity_change_path_invalid: {path}")
+        collection = updated[parts[0]]
+        key = parts[1]
+        exists = key in collection
+        if op == "add":
+            if exists:
+                raise ValueError(f"identity_change_add_target_exists: {path}")
+            value = operation["value"]
+            if not isinstance(value, str):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            collection[key] = value
+        elif op == "replace":
+            if not exists:
+                raise ValueError(f"identity_change_replace_target_missing: {path}")
+            value = operation["value"]
+            if not isinstance(value, str):
+                raise ValueError(f"identity_change_value_invalid: {path}")
+            collection[key] = value
+        elif op == "remove":
+            if not exists:
+                raise ValueError(f"identity_change_remove_target_missing: {path}")
+            del collection[key]
+        else:
+            raise ValueError(f"identity_change_operation_invalid: {op}")
+
+    if _lead_secret_findings(updated):
+        raise ValueError("identity_state_secret_detected")
+    return updated
+
+
+def _identity_key_matches_record(private_key: Ed25519PrivateKey, record: dict[str, Any]) -> None:
+    signer = _identity_signer(private_key)
+    if signer["fingerprint"] != record["signer"]["fingerprint"]:
+        raise ValueError("identity_signing_key_mismatch")
+
+
+def _identity_command_error(error: ValueError, json_output: bool) -> None:
+    if json_output:
+        typer.echo(json.dumps({"ok": False, "error": str(error)}))
+    else:
+        typer.echo(str(error))
+    raise typer.Exit(code=1)
+
+
+@identity_app.command("init")
+def identity_init(
+    name: str = typer.Option(..., "--name", help="Human-readable agent name"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    purpose: str = typer.Option("", "--purpose", help="Stable identity purpose"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            if _identity_load_records(root):
+                raise ValueError("identity_already_initialized")
+            state = {
+                "name": name.strip(),
+                "purpose": purpose,
+                "working_style": {},
+                "user_preferences": {},
+                "operating_principles": [],
+                "boundaries": [],
+            }
+            if _lead_secret_findings(state):
+                raise ValueError("identity_state_secret_detected")
+            record = _identity_build_record(
+                root,
+                private_key,
+                state,
+                version=1,
+                event="init",
+                previous=None,
+                summary="Initialize durable agent identity.",
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "fingerprint": record["signer"]["fingerprint"],
+        "version": record["version"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("verify")
+def identity_verify(
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    trust_fingerprint: str | None = typer.Option(None, "--trust-fingerprint", help="Expected sha256 public-key fingerprint"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root, expected_fingerprint=trust_fingerprint)
+        if not records:
+            raise ValueError("identity_not_initialized")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    latest = records[-1]
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "version": latest["version"],
+        "state_hash": latest["state_hash"],
+        "state": latest["state"],
+        "receipt_hash": latest["receipt_hash"],
+        "assurance": "trusted" if trust_fingerprint else "self_consistent",
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("history")
+def identity_history(
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root)
+        if not records:
+            raise ValueError("identity_not_initialized")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    history = [
+        {
+            "version": record["version"],
+            "event": record["event"],
+            "timestamp": record["timestamp"],
+            "summary": record["summary"],
+            "change_id": record["change_id"],
+            "target_version": record["target_version"],
+            "state_hash": record["state_hash"],
+            "receipt_hash": record["receipt_hash"],
+            "previous_receipt_hash": record["previous_receipt_hash"],
+            "requested_by": record["requested_by"],
+            "approved_by": record["approved_by"],
+        }
+        for record in records
+    ]
+    if json_output:
+        typer.echo(json.dumps(history, indent=2))
+    else:
+        for item in history:
+            typer.echo(
+                f"version={item['version']} event={item['event']} "
+                f"receipt_hash={item['receipt_hash']} summary={item['summary']}"
+            )
+
+
+@identity_app.command("apply")
+def identity_apply(
+    change: Path = typer.Option(..., "--change", help="Identity change proposal JSON within the workspace"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            records = _identity_load_records(root)
+            if not records:
+                raise ValueError("identity_not_initialized")
+            latest = records[-1]
+            _identity_key_matches_record(private_key, latest)
+            proposal = _identity_load_change(root, change)
+            if proposal["agent_id"] != latest["agent_id"]:
+                raise ValueError("identity_change_agent_id_mismatch")
+            if proposal["from_version"] != latest["version"]:
+                raise ValueError("identity_change_version_mismatch")
+            state = _identity_apply_operations(latest["state"], proposal["operations"])
+            record = _identity_build_record(
+                root,
+                private_key,
+                state,
+                version=int(latest["version"]) + 1,
+                event="change",
+                previous=latest,
+                summary=proposal["summary"],
+                change_id=proposal["change_id"],
+                requested_by=proposal["requested_by"],
+                approved_by=proposal["approved_by"],
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "version": record["version"],
+        "state_hash": record["state_hash"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("rollback")
+def identity_rollback(
+    version: int = typer.Option(..., "--version", min=1, help="Historical identity version to restore"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    requested_by: str | None = typer.Option(None, "--requested-by"),
+    approved_by: str | None = typer.Option(None, "--approved-by"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        private_key = _identity_private_key(signing_key)
+        with _identity_write_lock(root):
+            records = _identity_load_records(root)
+            if not records:
+                raise ValueError("identity_not_initialized")
+            latest = records[-1]
+            _identity_key_matches_record(private_key, latest)
+            if version >= int(latest["version"]):
+                raise ValueError("identity_rollback_target_must_be_historical")
+            target = next((record for record in records if record["version"] == version), None)
+            if target is None:
+                raise ValueError("identity_rollback_target_missing")
+            record = _identity_build_record(
+                root,
+                private_key,
+                json.loads(json.dumps(target["state"])),
+                version=int(latest["version"]) + 1,
+                event="rollback",
+                previous=latest,
+                summary=f"Rollback identity state to version {version}.",
+                target_version=version,
+                requested_by=requested_by,
+                approved_by=approved_by,
+            )
+            record_path = _identity_write_record(root, record)
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": record["agent_id"],
+        "version": record["version"],
+        "target_version": version,
+        "state_hash": record["state_hash"],
+        "receipt_hash": record["receipt_hash"],
+        "record": _display_path(root, record_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+def _identity_envelope_material(envelope: dict[str, Any]) -> dict[str, Any]:
+    material = dict(envelope)
+    material.pop("envelope_hash", None)
+    material.pop("signature", None)
+    return material
+
+
+@identity_app.command("export")
+def identity_export(
+    output: Path = typer.Option(..., "--output", help="Signed identity export path within the workspace"),
+    signing_key: Path = typer.Option(..., "--signing-key", help="External Ed25519 private key path"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        records = _identity_load_records(root)
+        if not records:
+            raise ValueError("identity_not_initialized")
+        latest = records[-1]
+        private_key = _identity_private_key(signing_key)
+        _identity_key_matches_record(private_key, latest)
+        output_path = _require_path_within(output, root, "identity_export_outside_workspace")
+        envelope: dict[str, Any] = {
+            "schema_version": "identity-envelope.v1",
+            "agent_id": latest["agent_id"],
+            "exported_at": _utc_now_iso(),
+            "record_count": len(records),
+            "latest_version": latest["version"],
+            "latest_receipt_hash": latest["receipt_hash"],
+            "signer": latest["signer"],
+            "records": records,
+        }
+        envelope["envelope_hash"] = _identity_hash(envelope)
+        envelope["signature"] = _identity_sign_hash(private_key, envelope["envelope_hash"])
+        _identity_validate_schema(root, envelope, IDENTITY_ENVELOPE_SCHEMA_FILE, "identity_envelope")
+        _atomic_write_text(output_path, json.dumps(envelope, indent=2, sort_keys=True) + "\n")
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "version": latest["version"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "envelope_hash": envelope["envelope_hash"],
+        "output": _display_path(root, output_path),
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
+
+
+@identity_app.command("import")
+def identity_import(
+    input_path: Path = typer.Option(..., "--input", help="Signed identity export within the workspace"),
+    trust_fingerprint: str = typer.Option(..., "--trust-fingerprint", help="Expected sha256 public-key fingerprint"),
+    root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON output"),
+) -> None:
+    root = root.resolve()
+    try:
+        envelope = _identity_read_workspace_json(root, input_path, "identity_import")
+        _identity_validate_schema(root, envelope, IDENTITY_ENVELOPE_SCHEMA_FILE, "identity_envelope")
+        envelope_hash = _identity_hash(_identity_envelope_material(envelope))
+        if envelope_hash != envelope.get("envelope_hash"):
+            raise ValueError("identity_envelope_hash_mismatch")
+        signer = envelope.get("signer")
+        if not isinstance(signer, dict):
+            raise ValueError("identity_signer_invalid")
+        if signer.get("fingerprint") != trust_fingerprint:
+            raise ValueError("identity_signer_fingerprint_mismatch")
+        _identity_verify_hash_signature(signer, envelope_hash, envelope.get("signature"))
+        raw_records = envelope.get("records")
+        if not isinstance(raw_records, list) or not all(isinstance(item, dict) for item in raw_records):
+            raise ValueError("identity_envelope_records_invalid")
+        records = _identity_verify_records(root, list(raw_records), expected_fingerprint=trust_fingerprint)
+        latest = records[-1]
+        if envelope["agent_id"] != latest["agent_id"]:
+            raise ValueError("identity_envelope_agent_id_mismatch")
+        if envelope["record_count"] != len(records):
+            raise ValueError("identity_envelope_record_count_mismatch")
+        if envelope["latest_version"] != latest["version"]:
+            raise ValueError("identity_envelope_latest_version_mismatch")
+        if envelope["latest_receipt_hash"] != latest["receipt_hash"]:
+            raise ValueError("identity_envelope_latest_receipt_mismatch")
+        if envelope["signer"] != latest["signer"]:
+            raise ValueError("identity_envelope_signer_mismatch")
+
+        imported_records = 0
+        with _identity_write_lock(root):
+            existing = _identity_load_records(root, expected_fingerprint=trust_fingerprint)
+            if len(existing) > len(records):
+                raise ValueError("identity_import_would_rewind_history")
+            for index, current in enumerate(existing):
+                if current["receipt_hash"] != records[index]["receipt_hash"]:
+                    raise ValueError("identity_import_history_conflict")
+            for record in records[len(existing):]:
+                _identity_write_record(root, record)
+                imported_records += 1
+    except ValueError as e:
+        _identity_command_error(e, json_output)
+        return
+    result = {
+        "ok": True,
+        "agent_id": latest["agent_id"],
+        "fingerprint": latest["signer"]["fingerprint"],
+        "version": latest["version"],
+        "receipt_hash": latest["receipt_hash"],
+        "imported_records": imported_records,
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        for key, value in result.items():
+            if key != "ok":
+                typer.echo(f"{key}: {value}")
 
 def _lead_load_artifacts_from_file(root: Path, path: Path) -> tuple[list[tuple[dict[str, Any], str]], list[str]]:
     records: list[tuple[dict[str, Any], str]] = []
@@ -1191,18 +2036,10 @@ def _lead_validate_artifact_schema(root: Path, raw: dict[str, Any], source_ref: 
             "lead_artifact_schema_dependency_missing: jsonschema is required; install requirements-cli.txt"
         ) from e
 
-    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = sorted(validator.iter_errors(raw), key=lambda e: list(e.path))
-    out: list[str] = []
-    for err in errors:
-        if err.path:
-            ptr = ".".join(str(part) for part in err.path)
-        else:
-            ptr = "$"
-        out.append(f"lead_artifact_schema_invalid: {source_ref} at {ptr} ({err.message})")
-    for finding in _lead_secret_findings(raw):
-        out.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
-    return out
+    findings = _lead_secret_findings(raw)
+    if findings:
+        return [f"lead_artifact_secret_detected: {source_ref} at {finding}" for finding in findings]
+    return _validate_json_payload(raw, schema, f"lead_artifact_schema_invalid: {source_ref}")
 
 
 def _lead_extract_files_touched(raw: dict[str, Any]) -> list[str]:
@@ -1346,8 +2183,16 @@ def _lead_normalize_artifact(
 
     task = str(raw.get("task") or "").strip()
     timestamp = str(raw.get("timestamp") or raw.get("generated_at") or "").strip()
+    _timestamp_key(timestamp)
     adapter = str(raw.get("adapter") or raw.get("tool") or raw.get("chat") or raw.get("agent") or "").strip()
-    verification_status = _lead_status(raw.get("verification_status") or ((raw.get("validation") or {}).get("ok")))
+    verification_status = _lead_status(raw.get("verification_status"))
+    execution = raw.get("execution")
+    if isinstance(execution, dict):
+        success = (execution.get("status") == "completed" and execution.get("launched") is True
+                   and execution.get("returncode") == 0 and (raw.get("validation") or {}).get("ok") is True)
+        verification_status = "verified" if success else "contradicted"
+        if not success:
+            open_loops.append({"text": "Investigate local execution outcome: " + str(execution.get("status") or "unknown"), "status": "open"})
 
     needs_human_approval = _lead_to_str_list(raw.get("human_approval_items"))
     needs_human_approval.extend(_lead_to_str_list(raw.get("needs_human_approval")))
@@ -1376,6 +2221,7 @@ def _lead_normalize_artifact(
         "contradictions": contradictions,
         "needs_human_approval": needs_human_approval,
         "verification_status": verification_status,
+        "execution": execution if isinstance(execution, dict) else None,
         "context_bundle_hash": str(raw.get("context_bundle_hash") or "") or None,
         "receipt_hash": str(raw.get("receipt_hash") or "") or None,
         "source_artifacts": _lead_to_str_list(raw.get("source_artifacts")),
@@ -1394,10 +2240,8 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
 
     discovered: list[Path] = []
     discovered.extend(sorted((root / "receipts").glob("*.jsonl")))
-    discovered.extend(sorted((root / ".sticky" / "receipts").glob("*.jsonl")))
-    resolved = root / ".agentmd" / "resolved-context.json"
-    if resolved.exists():
-        discovered.append(resolved)
+    # Compiler receipts and context manifests are provenance, not new tool runs.
+    # Feeding them back would manufacture evidence and recursively inflate state.
     contained = [_require_path_within(p, root, "artifact_path_outside_workspace") for p in discovered]
     unique = sorted({str(p): p for p in contained}.values(), key=lambda p: str(p).lower())
     return unique
@@ -1406,38 +2250,9 @@ def _lead_collect_artifact_paths(root: Path, explicit: list[Path]) -> list[Path]
 def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_override: str | None) -> dict[str, Any]:
     validation = validate_workspace(root)
 
-    if not artifacts:
-        default_task = (task_override or "").strip()
-        synthetic_id_source = default_task or "no-artifacts"
-        synthetic = {
-            "run_id": hashlib.sha256(synthetic_id_source.encode("utf-8")).hexdigest()[:16],
-            "timestamp": "",
-            "source_artifact": "none",
-            "task": default_task or None,
-            "adapter": None,
-            "files_touched": [],
-            "claims_made": [],
-            "decisions_made": [],
-            "open_loops": [],
-            "contradictions": [],
-            "needs_human_approval": [],
-            "verification_status": "unknown",
-            "context_bundle_hash": None,
-            "receipt_hash": None,
-            "git_state": {
-                "available": False,
-                "commit": None,
-                "dirty": None,
-                "changed_files": [],
-                "untracked_files": [],
-                "reason": "no_artifacts",
-            },
-        }
-        artifacts = [synthetic]
-
     artifacts_sorted = sorted(
         artifacts,
-        key=lambda a: (str(a.get("timestamp") or ""), str(a.get("run_id") or ""), str(a.get("source_artifact") or "")),
+        key=lambda a: (_timestamp_key(str(a.get("timestamp") or "")), str(a.get("run_id") or ""), str(a.get("source_artifact") or "")),
     )
 
     task_candidates = [str(a.get("task") or "").strip() for a in artifacts_sorted if a.get("task")]
@@ -1505,17 +2320,19 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
     true_claims = _lead_dedupe_sorted(true_claims)
     unverified_claims = _lead_dedupe_sorted(unverified_claims)
 
-    next_clean_action = "Proceed to the next scoped task."
+    next_clean_action = "Proceed to the next scoped task." if artifacts_sorted else "Collect a tool-run artifact before choosing the next task."
     if needs_human_approval:
         next_clean_action = "Resolve human-approval items before the next run."
     elif contradictions:
         next_clean_action = "Resolve contradictions and update verified state."
     elif unverified_claims:
         next_clean_action = "Verify unverified claims."
-    elif open_loops:
-        next_clean_action = f"Close open loop: {open_loops[0]['text']}"
+    else:
+        active_loops = [loop for loop in open_loops if loop["status"].strip().lower() not in LEAD_TERMINAL_LOOP_STATUSES]
+        if active_loops:
+            next_clean_action = f"Close open loop: {active_loops[0]['text']}"
 
-    latest = artifacts_sorted[-1]
+    latest = artifacts_sorted[-1] if artifacts_sorted else {}
     latest_context_bundle_hash = None
     latest_receipt_hash = None
     for artifact in reversed(artifacts_sorted):
@@ -1542,6 +2359,7 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
         "version": "0.2",
         "primitive": "ai_work_lead",
         "input_trust": "untrusted",
+        "evidence_status": "asserted_sources" if artifacts_sorted else "no_evidence",
         "task": task,
         "artifacts_ingested": len(artifacts_sorted),
         "artifact_sources": sorted({str(a.get("source_artifact") or "") for a in artifacts_sorted if a.get("source_artifact")}),
@@ -1594,8 +2412,6 @@ def _lead_compile_packet(root: Path, artifacts: list[dict[str, Any]], task_overr
         },
     }
 
-    material = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    packet["deterministic_hash"] = hashlib.sha256(material).hexdigest()
     return packet
 
 
@@ -1622,6 +2438,8 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     md: list[str] = [
         "# Sticky Current State",
         "",
+        "Evidence: source assertions only; hashes verify integrity, not the truth of claims.",
+        "",
         f"Task: {_markdown_untrusted(packet.get('task'))}",
         f"Deterministic Hash: {packet.get('deterministic_hash')}",
         f"Artifacts Ingested: {packet.get('artifacts_ingested')}",
@@ -1629,7 +2447,7 @@ def _lead_current_state_markdown(packet: dict[str, Any]) -> str:
     ]
 
     md.extend(lines_for_list("What Changed", current.get("what_changed", [])))
-    md.extend(lines_for_list("What Is True", current.get("what_is_true", [])))
+    md.extend(lines_for_list("Source-Reported Verified Claims", current.get("what_is_true", [])))
     md.extend(lines_for_list("What Is Unverified", current.get("what_is_unverified", [])))
     md.extend(lines_for_list("What Contradicts Prior State", current.get("what_contradicts_prior_state", [])))
     md.extend(lines_for_list("What Needs Human Approval", current.get("what_needs_human_approval", [])))
@@ -1734,21 +2552,23 @@ def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[
         return None, []
 
     warnings: list[str] = []
-    for path in reversed(sorted(receipts_dir.glob("*.jsonl"))):
+    latest: dict[str, Any] | None = None
+    expected_previous: str | None = None
+    for path in sorted(receipts_dir.glob("*.jsonl")):
         try:
             path = _require_path_within(path, root, "receipt_history_outside_workspace")
         except ValueError:
-            warnings.append(f"receipt_history_outside_workspace: {_display_path(root, path)}")
+            warnings.append("receipt_history_outside_workspace")
             continue
         if path.stat().st_size > LEAD_MAX_ARTIFACT_BYTES:
             warnings.append(f"receipt_history_too_large: {_display_path(root, path)}")
             continue
         try:
             lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        except OSError:
+        except (OSError, UnicodeError):
             warnings.append(f"receipt_history_unreadable: {_display_path(root, path)}")
             continue
-        for line in reversed(lines):
+        for line in lines:
             try:
                 receipt = _strict_json_loads(line)
             except (json.JSONDecodeError, ValueError):
@@ -1757,8 +2577,12 @@ def _lead_latest_valid_receipt(root: Path) -> tuple[dict[str, Any] | None, list[
             if not isinstance(receipt, dict) or not _receipt_hash_matches(receipt):
                 warnings.append(f"receipt_history_hash_mismatch: {_display_path(root, path)}")
                 continue
-            return receipt, warnings
-    return None, warnings
+            if receipt.get("previous_receipt_hash") != expected_previous:
+                warnings.append(f"receipt_history_chain_mismatch: {_display_path(root, path)}")
+                continue
+            latest = receipt
+            expected_previous = str(receipt["receipt_hash"])
+    return latest, warnings
 
 
 def _lead_latest_trust_history(
@@ -1882,7 +2706,7 @@ def _lead_build_trust_report(
     )
 
 
-def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) -> tuple[Path, dict[str, Any]]:
+def _lead_prepare_receipt(root: Path, packet: dict[str, Any], command_run: str) -> tuple[Path, dict[str, Any]]:
     proof = packet.get("proof", {})
     git_state = proof.get("git_state", {})
     timestamp = datetime.now(timezone.utc)
@@ -1918,11 +2742,11 @@ def _lead_write_receipt(root: Path, packet: dict[str, Any], command_run: str) ->
     material = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt["receipt_hash"] = hashlib.sha256(material).hexdigest()
 
-    receipts_dir = root / ".sticky" / "receipts"
-    receipts_dir.mkdir(parents=True, exist_ok=True)
+    receipts_dir = _require_path_within(root / ".sticky" / "receipts", root, "lead_receipt_output_outside_workspace")
     filename = timestamp.strftime("%Y%m%dT%H%M%S%fZ.jsonl")
     out_path = _require_path_within(receipts_dir / filename, root, "lead_receipt_output_outside_workspace")
-    _atomic_write_text(out_path, json.dumps(receipt) + "\n")
+    if out_path.exists():
+        raise ValueError("lead_receipt_already_exists")
     return out_path, receipt
 
 
@@ -1932,6 +2756,8 @@ def compile_lead_state(
     artifact_paths: list[Path],
     validate_artifacts: bool = False,
 ) -> tuple[dict[str, Any], Path, Path, Path, dict[str, Any]]:
+    if _lead_secret_findings(task_override):
+        raise ValueError("lead_artifact_secret_detected: task override")
     artifacts: list[dict[str, Any]] = []
     warnings: list[str] = []
     schema_errors: list[str] = []
@@ -1940,7 +2766,13 @@ def compile_lead_state(
         source_sha256 = _sha256_file(artifact_path) if loaded_records else ""
         warnings.extend(loaded_warnings)
         for idx, (raw, source_ref) in enumerate(loaded_records, start=1):
-            if validate_artifacts:
+            if not validate_artifacts:
+                if raw.get("phase") == "pre":
+                    continue  # Prepared is not evidence that a command executed.
+                if raw.get("schema_version") != "lead-artifact.v1" and not isinstance(raw.get("execution"), dict):
+                    warnings.append(f"artifact_metadata_not_run_evidence: {source_ref}")
+                    continue
+            if validate_artifacts or raw.get("schema_version") == "lead-artifact.v1":
                 try:
                     schema_errors.extend(_lead_validate_artifact_schema(root, raw, source_ref))
                 except ValueError as e:
@@ -1948,6 +2780,15 @@ def compile_lead_state(
             else:
                 for finding in _lead_secret_findings(raw):
                     schema_errors.append(f"lead_artifact_secret_detected: {source_ref} at {finding}")
+                execution = raw.get("execution") or {}
+                if (raw.get("phase") != "post" or not _receipt_hash_matches(raw)
+                    or execution.get("status") not in {"completed", "failed", "launch_failed", "timed_out", "output_limit_exceeded", "output_stream_incomplete", "interrupted"}
+                    or not isinstance(execution.get("launched"), bool)
+                    or not isinstance(raw.get("validation"), dict)
+                    or not isinstance((raw.get("validation") or {}).get("ok"), bool)):
+                    schema_errors.append(f"lead_execution_receipt_invalid: {source_ref}")
+            if schema_errors:
+                continue
             artifacts.append(
                 _lead_normalize_artifact(
                     raw,
@@ -1960,11 +2801,11 @@ def compile_lead_state(
     if validate_artifacts and warnings:
         raise ValueError("; ".join(warnings))
 
-    if validate_artifacts and not artifacts:
-        raise ValueError("lead_artifact_input_empty: no valid artifact records loaded")
-
     if schema_errors:
         raise ValueError("; ".join(schema_errors))
+
+    if validate_artifacts and not artifacts:
+        raise ValueError("lead_artifact_input_empty: no valid artifact records loaded")
 
     run_ids = [str(item.get("run_id") or "") for item in artifacts]
     duplicate_run_ids = sorted({run_id for run_id in run_ids if run_id and run_ids.count(run_id) > 1})
@@ -1980,14 +2821,20 @@ def compile_lead_state(
                 merged = sorted({*current_warnings, *warnings})
                 validation["warnings"] = merged
 
+    if not packet["validation"]["ok"]:
+        raise ValueError("lead_workspace_validation_failed: " + "; ".join(packet["validation"]["errors"]))
+    material = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    packet["deterministic_hash"] = hashlib.sha256(material).hexdigest()
+
     sticky_dir = _require_path_within(root / ".sticky", root, "lead_output_outside_workspace")
-    sticky_dir.mkdir(parents=True, exist_ok=True)
     json_path = _require_path_within(sticky_dir / "current-state.json", root, "lead_output_outside_workspace")
     md_path = _require_path_within(sticky_dir / "current-state.md", root, "lead_output_outside_workspace")
-    _atomic_write_text(json_path, json.dumps(packet, indent=2))
-    _atomic_write_text(md_path, _lead_current_state_markdown(packet))
-
-    receipt_path, receipt = _lead_write_receipt(root, packet, command_run="agentmd lead compile")
+    receipt_path, receipt = _lead_prepare_receipt(root, packet, command_run="agentmd lead compile")
+    _atomic_write_bundle(root, [
+        (json_path, json.dumps(packet, indent=2)),
+        (md_path, _lead_current_state_markdown(packet)),
+        (receipt_path, json.dumps(receipt) + "\n"),
+    ])
     return packet, json_path, md_path, receipt_path, receipt
 
 
@@ -2093,34 +2940,149 @@ def receipt(
     typer.echo(f"receipt_hash: {data['receipt_hash']}")
 
 
+def _execute_local_command(root: Path, argv: list[str], context: Path, task: str, timeout: float, output_limit: int) -> dict[str, Any]:
+    """Execute explicit argv; hash bounded output without retaining or displaying it.
+
+    This is execution with the caller's privileges/environment, NOT a sandbox.
+    """
+    result: dict[str, Any] = {"status": "launch_failed", "launched": False, "returncode": None}
+    exceeded = threading.Event()
+    streams: dict[str, dict[str, Any]] = {}
+    env = dict(os.environ)
+    env.update(AGENTMD_CONTEXT_FILE=str(context), AGENTMD_TASK=task)
+    try:
+        process = subprocess.Popen(
+            argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+            start_new_session=(os.name == "posix"),
+        )
+    except (OSError, ValueError):
+        return result
+    result["launched"] = True
+
+    def digest_stream(name: str, pipe: Any) -> None:
+        digest = hashlib.sha256()
+        count = 0
+        complete = False
+        try:
+            while True:
+                chunk = pipe.read1(65536)
+                if not chunk:
+                    complete = True
+                    break
+                remaining = max(0, output_limit - count)
+                digest.update(chunk[:remaining])
+                count += len(chunk)
+                if count > output_limit:
+                    exceeded.set()
+                    break
+        except (OSError, ValueError):
+            complete = False
+        finally:
+            streams[name] = {"sha256": digest.hexdigest(), "bytes_observed": count, "hashed_bytes": min(count, output_limit), "complete": complete}
+
+    readers = [threading.Thread(target=digest_stream, args=(name, pipe), daemon=True)
+               for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr))]
+    for reader in readers:
+        reader.start()
+
+    def terminate() -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    status = "completed"
+    try:
+        while process.poll() is None:
+            if exceeded.is_set():
+                status = "output_limit_exceeded"
+                terminate()
+                break
+            if time.monotonic() >= deadline:
+                status = "timed_out"
+                terminate()
+                break
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        status = "interrupted"
+        terminate()
+    process.wait()
+    for reader in readers:
+        reader.join(timeout=0.5)
+    if any(reader.is_alive() for reader in readers):
+        terminate()  # Clean up POSIX descendants that inherited output pipes.
+        for reader in readers:
+            reader.join(timeout=0.5)
+        status = "output_stream_incomplete"
+    elif exceeded.is_set() and status == "completed":
+        status = "output_limit_exceeded"
+    elif status == "completed" and (len(streams) != 2 or not all(item["complete"] for item in streams.values())):
+        status = "output_stream_incomplete"
+    if status == "completed" and process.returncode != 0:
+        status = "failed"
+    result.update(status=status, returncode=process.returncode, output=streams)
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None and not any(reader.is_alive() for reader in readers):
+            pipe.close()
+    return result
+
+
 @app.command()
 def run(
-    adapter: str = typer.Option(..., "--adapter", help="Adapter to launch: codex|claude|gemini"),
-    task: str = typer.Option(..., "--task", help="Task to execute"),
+    task: str = typer.Option(..., "--task", help="Task passed as AGENTMD_TASK, never interpolated into a shell"),
     root: Path = typer.Option(Path("."), "--root", help="Workspace root"),
+    adapter: str | None = typer.Option(None, "--adapter", help="Optional caller-asserted label; does not select provider commands"),
+    timeout: float = typer.Option(300.0, "--timeout", min=0.1, max=3600.0, help="Maximum child runtime in seconds"),
+    output_limit: int = typer.Option(1048576, "--output-limit", min=1024, max=16777216, help="Maximum hashed bytes per stdout/stderr stream"),
+    command: list[str] = typer.Argument(None, help="Explicit executable and arguments after -- (no shell)"),
 ) -> None:
+    if not math.isfinite(timeout):
+        raise typer.BadParameter("timeout must be finite")
+    if not command:
+        raise typer.BadParameter("provide an explicit command after --; adapters are labels, not integrations")
     root = root.resolve()
-    adapter = adapter.lower().strip()
-    if adapter not in ADAPTER_INSTRUCTIONS:
-        raise typer.BadParameter("adapter must be one of: codex, claude, gemini")
-
-    resolve_context(root, task)
-    write_receipt(root, command_run=f"agentmd run --adapter {adapter} --task {task}", task=task, adapter=adapter, phase="pre")
-
-    context_file = ".agentmd/resolved-context.json"
-    launch = ADAPTER_INSTRUCTIONS[adapter].format(task=task.replace('"', '\\"'), context_file=context_file)
-    typer.echo("agentmd run v1 does not execute adapters yet.")
-    typer.echo(f"launch_instruction: {launch}")
-
-    out_path, data = write_receipt(
-        root,
-        command_run=f"agentmd run --adapter {adapter} --task {task}",
-        task=task,
-        adapter=adapter,
-        phase="post",
-    )
+    try:
+        if _lead_secret_findings({"task": task, "adapter": adapter}):
+            raise ValueError("run_secret_detected: do not put credentials in recorded task or adapter labels")
+        validation = validate_workspace(root)
+        if not validation["ok"]:
+            raise ValueError("run_workspace_validation_failed: " + "; ".join(validation["errors"]))
+        receipts_dir = _require_path_within(root / "receipts", root, "receipt_output_outside_workspace")
+        if receipts_dir.exists() and not receipts_dir.is_dir():
+            raise ValueError("receipt_output_not_directory")
+        resolved, context = resolve_context(root, task)
+        execution = {
+            "argv_sha256": hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest(),
+            "argc": len(command), "cwd": str(root),
+            "context_manifest_sha256": _sha256_file(context),
+            "context_bundle_hash": resolved["context_bundle_hash"],
+            "timeout_seconds": timeout, "output_limit_bytes_per_stream": output_limit,
+            "status": "prepared", "launched": False,
+            "privacy": "argv and output are hash-only; environment inherited; not sandboxed",
+        }
+        _, before = write_receipt(root, command_run="agentmd run", task=task, adapter=adapter, phase="pre", execution=execution)
+        outcome = _execute_local_command(root, command, context, task, timeout, output_limit)
+        execution = {**execution, **outcome, "pre_receipt_hash": before["receipt_hash"]}
+        out_path, data = write_receipt(root, command_run="agentmd run", task=task, adapter=adapter, phase="post", execution=execution)
+    except (ValueError, OSError) as error:
+        typer.echo(str(error))
+        raise typer.Exit(code=1)
+    typer.echo(f"execution_status: {execution['status']}")
+    typer.echo(f"returncode: {execution['returncode']}")
+    typer.echo(f"workspace_validation_ok: {data['validation']['ok']}")
     typer.echo(f"receipt: {_relative(root, out_path)}")
     typer.echo(f"receipt_hash: {data['receipt_hash']}")
+    if execution["status"] in {"completed", "failed"}:
+        code = int(execution["returncode"] or 0)
+        if code == 0 and not data["validation"]["ok"]:
+            code = 1
+        raise typer.Exit(code=code if code >= 0 else 128 - code)
+    raise typer.Exit(code={"launch_failed": 127, "timed_out": 124, "interrupted": 130}.get(execution["status"], 125))
 
 
 if __name__ == "__main__":

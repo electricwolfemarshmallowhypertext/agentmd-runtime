@@ -2,3 +2,4 @@ typer==0.25.1
 requests==2.33.0
 jsonschema==4.25.1
 pyyaml==6.0.3
+cryptography==50.0.1

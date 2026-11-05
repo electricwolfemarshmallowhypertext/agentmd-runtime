@@ -10,6 +10,8 @@ from datetime import datetime
 import numpy as np
 from enum import Enum
 import structlog
+from uuid import uuid4
+from .embedding_contract import DEFAULT_EMBEDDING_DIMENSION, MAX_EMBEDDING_DIMENSION, validate_vector
 from .exceptions import MemoryValidationError
 
 # Configure logging
@@ -48,7 +50,7 @@ class MemoryMetadata(BaseModel):
 class Memory(BaseModel):
     """Memory data model"""
     
-    id: str = Field(..., description="Unique memory identifier")
+    id: str = Field(default_factory=lambda: uuid4().hex, min_length=1, description="Unique memory identifier")
     text: str = Field(..., min_length=1, max_length=4096)
     type: MemoryType = Field(..., description="Memory type")
     salience: float = Field(..., ge=0.0, le=1.0)
@@ -57,6 +59,7 @@ class Memory(BaseModel):
     thread_id: str = Field(..., description="Conversation thread ID")
     user_id: str = Field(..., description="User ID")
     persona_id: str = Field(..., description="Persona ID")
+    embedding_dimension: int = Field(DEFAULT_EMBEDDING_DIMENSION, gt=0, le=MAX_EMBEDDING_DIMENSION)
     embedding: Optional[List[float]] = Field(None, description="Vector embedding")
     metadata: MemoryMetadata = Field(default_factory=MemoryMetadata)
     
@@ -64,14 +67,8 @@ class Memory(BaseModel):
         use_enum_values = True
         
     @validator("embedding")
-    def validate_embedding(cls, v: Optional[List[float]]) -> Optional[List[float]]:
-        """Validate embedding dimensions"""
-        if v is not None:
-            if len(v) != 1024:
-                raise ValueError("Embedding must have 1024 dimensions")
-            if not all(isinstance(x, float) for x in v):
-                raise ValueError("Embedding must contain only floats")
-        return v
+    def validate_embedding(cls, v: Optional[List[float]], values: Dict[str, Any]) -> Optional[List[float]]:
+        return validate_vector(v, values.get("embedding_dimension", DEFAULT_EMBEDDING_DIMENSION)) if v is not None else None
 
 class MemoryQuery(BaseModel):
     """Memory query model"""
@@ -107,7 +104,7 @@ class MemoryBatch(BaseModel):
     user_id: str
     thread_id: str
     persona_id: str
-    batch_id: str = Field(..., description="Unique batch identifier")
+    batch_id: str = Field(default_factory=lambda: uuid4().hex, description="Unique batch identifier")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     
@@ -136,18 +133,14 @@ class MemoryVector(BaseModel):
     """Memory vector model"""
     
     memory_id: str
+    embedding_dimension: int = Field(DEFAULT_EMBEDDING_DIMENSION, gt=0, le=MAX_EMBEDDING_DIMENSION)
     embedding: List[float]
     metadata: Dict[str, Any] = Field(default_factory=dict)
     
     @validator("embedding")
-    def validate_vector(cls, v: List[float]) -> List[float]:
-        """Validate vector data"""
-        if len(v) != 1024:
-            raise ValueError("Vector must have 1024 dimensions")
-        if not all(isinstance(x, float) for x in v):
-            raise ValueError("Vector must contain only floats")
-        return v
-        
+    def validate_vector(cls, v: List[float], values: Dict[str, Any]) -> List[float]:
+        return validate_vector(v, values.get("embedding_dimension", DEFAULT_EMBEDDING_DIMENSION))
+
     def normalize(self) -> None:
         """Normalize vector to unit length"""
         norm = np.linalg.norm(self.embedding)

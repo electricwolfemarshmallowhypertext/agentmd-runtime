@@ -1,0 +1,13 @@
+# Runtime dependencies for apps.api.src.memory.server (no model/provider runtime).
+-r requirements-cli.txt
+fastapi==0.141.1
+starlette==1.7.0
+uvicorn==0.24.0
+pydantic==2.13.5
+httpx==0.28.1
+SQLAlchemy==2.0.23
+redis==5.0.1
+structlog==23.1.0
+prometheus-client==0.18.0
+xxhash==3.4.1
+numpy==1.26.4
